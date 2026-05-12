@@ -47,6 +47,35 @@ def save_group_masks(video, ctx_idx, pred_idx, label, encoder, path, n_frames_sh
     plt.tight_layout(); plt.savefig(path, dpi=110); plt.close()
 
 
+def save_mask_animation(video, ctx_idx, pred_idx, label, encoder, path):
+    """Animated gif: original | context | target across all T frames."""
+    import matplotlib.animation as animation
+    v = (video[0, 0].detach().cpu() + 0.5).clamp(0, 1)
+    T_frames, H, _ = v.shape
+    cm = _patches_to_pixel_mask(ctx_idx, encoder.t_grid, encoder.s_grid,
+                                 encoder.t_patch, encoder.patch_size, T_frames, H)
+    tm = _patches_to_pixel_mask(pred_idx, encoder.t_grid, encoder.s_grid,
+                                 encoder.t_patch, encoder.patch_size, T_frames, H)
+    fig, axes = plt.subplots(1, 3, figsize=(7.5, 2.8))
+    fig.suptitle(f"V-JEPA mask group: {label}", fontsize=10)
+    ims = []
+    for ax, title in zip(axes, ["original", "context", "targets"]):
+        ax.set_title(title, fontsize=9); ax.set_xticks([]); ax.set_yticks([])
+    im0 = axes[0].imshow(v[0].numpy(), cmap="gray", vmin=0, vmax=1)
+    im1 = axes[1].imshow((v[0] * cm[0]).numpy(), cmap="gray", vmin=0, vmax=1)
+    im2 = axes[2].imshow((v[0] * tm[0]).numpy(), cmap="gray", vmin=0, vmax=1)
+
+    def update(t):
+        im0.set_data(v[t].numpy())
+        im1.set_data((v[t] * cm[t]).numpy())
+        im2.set_data((v[t] * tm[t]).numpy())
+        return im0, im1, im2
+
+    anim = animation.FuncAnimation(fig, update, frames=T_frames, interval=200, blit=True)
+    anim.save(path, writer="pillow", dpi=110)
+    plt.close()
+
+
 def save_loss_curves(losses_per_group, path):
     plt.figure(figsize=(6, 3.5))
     for label, losses in losses_per_group.items():
@@ -71,6 +100,10 @@ def main(epochs=3):
                          f"{g['label']} ({g['n_blocks']} tubes, block {g['block_hw']})",
                          out["ctx_enc"],
                          f"{SAMPLES_DIR}/vjepa_masks_{g['label']}.png")
+        save_mask_animation(videos[0:1], g["ctx"][0], g["pred"][0],
+                            f"{g['label']} ({g['n_blocks']} tubes, block {g['block_hw']})",
+                            out["ctx_enc"],
+                            f"{SAMPLES_DIR}/vjepa_masks_{g['label']}.gif")
 
     save_loss_curves(out["losses_per_group"], f"{SAMPLES_DIR}/vjepa_loss.png")
     print(f"artifacts in ./{SAMPLES_DIR}/")

@@ -48,6 +48,13 @@ The mask-grid figures below are real outputs from one training step:
 
 Top row: the original video frames (we show 5 evenly-spaced timesteps). Middle row: the **context** — what the encoder sees. Bottom row: the **targets** — what the predictor must reconstruct. Notice that the masks are identical across timesteps: that's the "tube" property. Short-range tubes nibble the corners; long-range tubes hide most of the frame.
 
+Animated, the tube property is clearer — the mask stays put in space while the digits move:
+
+![Short-range tubes animated](./samples/vjepa_masks_short.gif)
+![Long-range tubes animated](./samples/vjepa_masks_long.gif)
+
+Original frames on the left, context (visible to the encoder) in the middle, targets (what the predictor reconstructs) on the right. The black rectangles are the tube footprints — same `(row, col)` cells at every timestep.
+
 ## Building blocks
 
 ### Tubelet encoder
@@ -218,6 +225,22 @@ The loss is reported per mask group. Long-range tubes are harder (less context) 
 Both curves drop steeply for the first ~100 steps, then plateau in the 0.05–0.06 L1 range. The plateau is the noise floor: with random Conv3d features as targets and tight context, there's a limit to how well a tiny predictor can hit them.
 
 Moving MNIST has no class labels, so we don't run a linear probe here. (The I-JEPA tutorial does that on CIFAR-10.) The proof that the algorithm trains is the loss curve plus the masks rendering correctly.
+
+## Core insights
+
+Five things V-JEPA gets right, in roughly the order they matter:
+
+1. **Predict embeddings, not pixels.** Inherited from I-JEPA. The encoder is free to discard pixel-level texture and lighting and spend capacity on whatever's predictable across spacetime. There is no pixel decoder anywhere in the model.
+
+2. **Tubes, not random patches.** Tube masking — a spatial block held constant across *every* temporal slice — kills the cheapest temporal shortcut (copy from the previous frame). The predictor must use spatially distant context, which pushes the encoder toward higher-level features.
+
+3. **Two mask scales, not one.** The 8×0.15 short-range group covers small targets with rich context (easy locally, lots of detail). The 2×0.7 long-range group hides most of the frame and forces global reasoning. Training on both at once gives a curriculum-by-batch effect — the encoder has to do both jobs.
+
+4. **EMA target encoder is load-bearing.** The target encoder is a slow-moving copy of the context encoder. Late in training it tracks a recent-history-mean of the context encoder rather than its current state. Without this, the loss collapses — the network learns to output whatever the target encoder happens to output, which is whatever the network just output.
+
+5. **L1, not L2.** The paper switched from squared error to absolute error and reports it's more stable. Latent-space targets carry occasional outliers; L1 cares less about them.
+
+The first three are about *what* you predict; the last two are about *how* you train. Both matter equally — strip any one of them and the method stops working.
 
 ## What's next
 
