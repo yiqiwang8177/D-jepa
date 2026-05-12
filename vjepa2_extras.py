@@ -68,6 +68,34 @@ def save_rollout_demo(encoder, ac, video, actions, path):
     plt.savefig(path, dpi=110); plt.close()
 
 
+def save_input_animation(video, action, path, t_patch=2):
+    """Animated gif of one clip with the per-tubelet action vector overlaid."""
+    import matplotlib.animation as animation
+    v = (video[0, 0].detach().cpu() + 0.5).clamp(0, 1)
+    T_frames, H, _ = v.shape
+    a = action.detach().cpu().numpy()                    # (t_latent, 2)
+    fig, ax = plt.subplots(figsize=(3.5, 3.5))
+    ax.set_xticks([]); ax.set_yticks([])
+    im = ax.imshow(v[0].numpy(), cmap="gray", vmin=0, vmax=1)
+    txt = ax.text(2, 5, "", color="lime", fontsize=9,
+                  bbox=dict(facecolor="black", alpha=0.6, pad=2))
+    arrow = ax.annotate("", xy=(H // 2, H // 2), xytext=(H // 2, H // 2),
+                        arrowprops=dict(arrowstyle="->", color="lime", lw=2))
+
+    def update(t):
+        t_lat = t // t_patch
+        ax_, ay_ = a[t_lat]
+        im.set_data(v[t].numpy())
+        txt.set_text(f"t={t}  a=({ax_:+.2f}, {ay_:+.2f})")
+        arrow.xy = (H // 2 + 18 * ax_, H // 2 + 18 * ay_)
+        arrow.set_position((H // 2, H // 2))
+        return im, txt, arrow
+
+    anim = animation.FuncAnimation(fig, update, frames=T_frames, interval=200, blit=False)
+    anim.save(path, writer="pillow", dpi=110)
+    plt.close()
+
+
 def save_loss_curves(losses, path, title):
     plt.figure(figsize=(6, 3.5))
     for k, v in losses.items():
@@ -96,6 +124,9 @@ def main(phase1_epochs=3, phase2_epochs=4):
     videos = videos.to(out["device"]); actions = actions.to(out["device"])
     save_rollout_demo(encoder, out["ac"], videos[0:1], actions[0:1],
                       f"{SAMPLES_DIR}/vjepa2_ac_rollout.png")
+    save_input_animation(videos[0:1].cpu(), actions[0].cpu(),
+                         f"{SAMPLES_DIR}/vjepa2_input.gif",
+                         t_patch=encoder.t_patch)
 
     save_loss_curves(out["phase1_losses"],
                      f"{SAMPLES_DIR}/vjepa2_phase1_loss.png",

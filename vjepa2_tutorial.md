@@ -18,6 +18,10 @@ The first phase is just V-JEPA — already covered in [`vjepa_tutorial.md`](./vj
 
 We need a video dataset with known actions. Real V-JEPA 2-AC uses robot trajectories. We use a synthetic stand-in: **moving-digit videos with controllable velocity**.
 
+![Synthetic clip with per-tubelet action overlaid](./samples/vjepa2_input.gif)
+
+A green arrow shows the action vector (the velocity for the current tubelet) drawn from the digit's center. The action changes every 2 frames — one update per tubelet — and the digit's motion in the next tubelet follows it (modulo wall bounces).
+
 For each clip:
 - one MNIST digit, rendered on a 64×64 canvas
 - per-tubelet **velocity** sampled in $[-1, +1]^2$ (scaled by `V_MAX=5` pixels/frame)
@@ -167,6 +171,24 @@ This is honestly what should happen given how we set the toy up:
 - Phase 1 pre-stabilizes $f_{\bar\theta}$ so the EMA target is smooth across time.
 
 The result: predicting $z_{t+1} \approx z_t$ already explains most of the variance, and adding action information offers only a small correction. **The machinery is correct; the data isn't rich enough to make it visible.** On real robot-trajectory data the gap is the entire signal.
+
+## Core insights
+
+Five things V-JEPA 2 + V-JEPA 2-AC get right, in roughly the order they matter:
+
+1. **Two phases, not one.** Representation learning (phase 1) and world-modeling (phase 2) are decoupled. Phase 1 trains on internet-scale action-free video; phase 2 adapts a small predictor to a tiny amount of action-trajectory data. A different problem each time, a different objective each time.
+
+2. **Freeze the encoder in phase 2.** No EMA, no representation update, no collapse risk. The encoder has already learned a stable latent space; the AC predictor only needs to learn *dynamics within that space*. This is what makes "small amount of action data" sufficient.
+
+3. **Predict in latent space, not pixels.** Inherited from V-JEPA. The AC predictor never decodes back to RGB — it predicts the next *embedding*, not the next *frame*. Cheaper, and it forces the loss to live where the encoder's prior actually applies.
+
+4. **Teacher forcing + rollout.** Teacher forcing gives clean training signal at every step (the predictor sees true `z_t`); rollout penalizes error accumulation when feeding predictions back as input. Together they train the one-step transition function while keeping multi-step rollouts stable.
+
+5. **The AC predictor is `(z, a) → z'`.** A single autoregressive step is the unit. Multi-step prediction is just `step` applied $k$ times. This makes the trained model directly usable for planning: query the predictor with a candidate action sequence, score the predicted latent trajectory, pick the best one.
+
+What we don't reproduce here: a pixel decoder. Real V-JEPA 2-AC papers / blog posts decode predicted latents back to RGB for visualization — that decoder is a separate model trained on top of frozen V-JEPA 2 features. Without it, "what did the predictor predict?" lives in latent space and can only be measured by L1 error against the encoder's targets.
+
+## What's next
 
 ## Hyperparameters
 
