@@ -168,4 +168,5 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
             "losses": losses, "loader": loader, "device": device}
 
 
-if __name__ == "__main__": train()
+if __name__ == "__main__":
+    train()

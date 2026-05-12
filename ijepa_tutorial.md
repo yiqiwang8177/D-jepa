@@ -67,21 +67,23 @@ I-JEPA has four pieces. We will build each, then assemble them.
 A standard Vision Transformer. Patches go through a 2D convolution that produces one embedding per patch, then a stack of self-attention blocks.
 
 ```python
-class Encoder(nn.Module):
+class Encoder(nn.Module):                                # f_theta (context encoder)
     def __init__(self, img_size=32, patch_size=4, dim=128, depth=6, heads=4):
         super().__init__()
-        self.grid = img_size // patch_size
+        self.grid = img_size // patch_size               # 32 / 4 = 8 -> 8x8 patch grid
         self.patch_proj = nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size)
+                                                         # patchify + linear-embed in one Conv2d
         self.register_buffer("pos", sincos_2d(self.grid, self.grid, dim))
+                                                         # fixed 2D sin-cos positional embedding
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
 
     def forward(self, imgs, idx=None):
-        tokens = self.patch_proj(imgs).flatten(2).transpose(1, 2)
-        if idx is not None:
+        tokens = self.patch_proj(imgs).flatten(2).transpose(1, 2)   # (B, 64, dim) patch embeddings
+        if idx is not None:                              # idx -> encode only these patches
             tokens = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, tokens.size(-1)))
         x = tokens + self.pos[idx if idx is not None else torch.arange(tokens.size(1))]
-        for blk in self.blocks: x = blk(x)
+        for blk in self.blocks: x = blk(x)               # ViT self-attention stack
         return self.norm(x)
 ```
 
@@ -108,9 +110,9 @@ theta_target  <-  m * theta_target + (1 - m) * theta_context
 
 ```python
 @torch.no_grad()
-def ema_update(tgt, online, m):
+def ema_update(tgt, online, m):                          # tgt = target encoder, online = context encoder
     for pt, po in zip(tgt.parameters(), online.parameters()):
-        pt.mul_(m).add_(po.detach(), alpha=1 - m)
+        pt.mul_(m).add_(po.detach(), alpha=1 - m)        # theta_bar <- m * theta_bar + (1 - m) * theta
 ```
 
 ### The predictor
@@ -118,25 +120,25 @@ def ema_update(tgt, online, m):
 The predictor takes context embeddings and *target position queries*, and outputs predicted target embeddings. Each position query is a learned `mask_token` plus the target patch's positional embedding.
 
 ```python
-class Predictor(nn.Module):
+class Predictor(nn.Module):                              # g_phi
     def __init__(self, grid, enc_dim=128, dim=64, depth=4, heads=4):
         super().__init__()
-        self.in_proj = nn.Linear(enc_dim, dim)
-        self.out_proj = nn.Linear(dim, enc_dim)
+        self.in_proj = nn.Linear(enc_dim, dim)           # encoder-dim 128 -> predictor-dim 64
+        self.out_proj = nn.Linear(dim, enc_dim)          # back to encoder-dim for the loss
         self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        nn.init.trunc_normal_(self.mask_token, std=0.02) # learned "this is a target slot" vector
         self.register_buffer("pos", sincos_2d(grid, grid, dim))
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
 
     def forward(self, ctx, ctx_idx, tgt_idx):
-        B, T = ctx.size(0), tgt_idx.size(1)
+        B, T = ctx.size(0), tgt_idx.size(1)              # T = number of target patches
         x = torch.cat([
-            self.in_proj(ctx) + self.pos[ctx_idx],
-            self.mask_token.expand(B, T, -1) + self.pos[tgt_idx],
+            self.in_proj(ctx) + self.pos[ctx_idx],       # projected context tokens + their positions
+            self.mask_token.expand(B, T, -1) + self.pos[tgt_idx],  # mask tokens + target positions
         ], dim=1)
-        for blk in self.blocks: x = blk(x)
-        return self.out_proj(self.norm(x[:, -T:]))
+        for blk in self.blocks: x = blk(x)               # bidirectional self-attention
+        return self.out_proj(self.norm(x[:, -T:]))       # take target-slot outputs, project back
 ```
 
 The predictor is narrower (`dim=64`) than the encoder (`dim=128`). It only has to predict patch embeddings, not extract them, so a smaller module is enough.
@@ -147,21 +149,21 @@ The mask sampler picks block sizes once per batch and block locations per image:
 
 ```python
 def sample_ijepa_masks(B, grid, n_targets=4, min_ctx=4, rng=None):
-    th, tw = _bsize(grid, rng.uniform(0.15, 0.20), rng.uniform(0.75, 1.5))
-    ch, cw = _bsize(grid, rng.uniform(0.85, 1.0), 1.0)
+    th, tw = _bsize(grid, rng.uniform(0.15, 0.20), rng.uniform(0.75, 1.5))  # target block shape (shared)
+    ch, cw = _bsize(grid, rng.uniform(0.85, 1.0), 1.0)                      # context block shape (shared)
     ctx_list, tgt_lists = [None] * B, [[None] * B for _ in range(n_targets)]
-    for b in range(B):
+    for b in range(B):                                   # per-item: sample LOCATIONS
         ts = [_block(grid, rng.randint(0, grid - th), rng.randint(0, grid - tw),
-                     th, tw) for _ in range(n_targets)]
+                     th, tw) for _ in range(n_targets)]  # 4 target blocks at random positions
         for m, t in enumerate(ts):
             tgt_lists[m][b] = sorted(t)
-        for _ in range(10):
+        for _ in range(10):                              # retry context placement up to 10 times
             ctx = _block(grid, rng.randint(0, grid - ch), rng.randint(0, grid - cw),
-                         ch, cw) - set().union(*ts)
+                         ch, cw) - set().union(*ts)      # remove target patches from context
             if len(ctx) >= min_ctx: break
         ctx_list[b] = sorted(ctx) if ctx else [0]
-    L = min(len(c) for c in ctx_list)
-    return [sorted(rng.sample(c, L)) for c in ctx_list], tgt_lists
+    L = min(len(c) for c in ctx_list)                    # batch-wide min context length
+    return [sorted(rng.sample(c, L)) for c in ctx_list], tgt_lists  # random subsample to trim
 ```
 
 A few details worth noting:
@@ -221,35 +223,35 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05,
           ema_start=0.996, ema_end=1.0, device=None):
     device = device or pick_device()
     tfm = transforms.Compose([
-        transforms.RandomResizedCrop(32, scale=(0.3, 1.0)),
+        transforms.RandomResizedCrop(32, scale=(0.3, 1.0)),    # cheap augmentation
         transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
     ds = datasets.CIFAR10("./data", train=True, download=True, transform=tfm)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    ctx_enc = Encoder().to(device)
-    tgt_enc = copy.deepcopy(ctx_enc).to(device)
+    ctx_enc = Encoder().to(device)                       # f_theta -- trained
+    tgt_enc = copy.deepcopy(ctx_enc).to(device)          # f_theta_bar -- EMA, no gradient
     for p in tgt_enc.parameters(): p.requires_grad_(False)
-    pred = Predictor(grid=ctx_enc.grid).to(device)
+    pred = Predictor(grid=ctx_enc.grid).to(device)       # g_phi -- trained
     opt = torch.optim.AdamW(param_groups([ctx_enc, pred], wd), lr=lr)
-
+                                                         # WD only on 2D+ params (no biases/norms)
     total = epochs * len(loader); rng = random.Random(0); step = 0
     for epoch in range(epochs):
         for imgs, _ in loader:
             imgs = imgs.to(device)
             cl, tls = sample_ijepa_masks(imgs.size(0), ctx_enc.grid, rng=rng)
-            ci = torch.tensor(cl, device=device)
-            tis = [torch.tensor(t, device=device) for t in tls]
+            ci = torch.tensor(cl, device=device)             # context indices (B, L_ctx)
+            tis = [torch.tensor(t, device=device) for t in tls]  # 4 target index tensors
             for g in opt.param_groups: g["lr"] = lr_warmup_cosine(step, total, lr)
             with torch.no_grad():
-                full = F.layer_norm(tgt_enc(imgs), (ctx_enc.dim,))
-            ce = ctx_enc(imgs, ci)
+                full = F.layer_norm(tgt_enc(imgs), (ctx_enc.dim,))    # LN(s_y); no_grad
+            ce = ctx_enc(imgs, ci)                                    # s_x
             loss = sum(
-                F.smooth_l1_loss(pred(ce, ci, ti),
+                F.smooth_l1_loss(pred(ce, ci, ti),                    # hat_s_y(i)
                                  full.gather(1, ti.unsqueeze(-1).expand(-1, -1, ctx_enc.dim)))
-                for ti in tis) / len(tis)
-            opt.zero_grad(); loss.backward(); opt.step()
-            m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
-            ema_update(tgt_enc, ctx_enc, m); step += 1
+                for ti in tis) / len(tis)                             # (1/M) * sum over 4 targets
+            opt.zero_grad(); loss.backward(); opt.step()              # update f_theta, g_phi
+            m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))  # linear 0.996->1.0
+            ema_update(tgt_enc, ctx_enc, m); step += 1                # update f_theta_bar
 ```
 
 The orchestration is short because the work is done by the four building blocks.
