@@ -11,7 +11,7 @@ Supervised learning needs labels. Labels are expensive. *Self-supervised learnin
 
 Most self-supervised methods for vision do one of two things:
 
-1. **Reconstruct pixels** — hide patches and predict their pixel values (MAE, BEiT).
+1. **Reconstruct inputs** — hide patches and predict their pixels (MAE) or their tokenized values (BEiT).
 2. **Contrast views** — take two augmented views of the same image, pull their embeddings together, push other images' embeddings apart (SimCLR, BYOL, DINO).
 
 Both work. Both have a complaint. Pixel reconstruction spends model capacity on textures and lighting; those details may not matter for downstream tasks. Contrastive methods need carefully designed augmentations and many negatives.
@@ -168,10 +168,10 @@ A few details worth noting:
 
 ## The loss
 
-The objective is:
+The paper's objective is:
 
 $$
-\mathcal{L} \;=\; \frac{1}{M}\sum_{i=1}^{M}\; \mathrm{smooth\_l1}\!\left(\, g_\phi(s_x,\, B_i),\; \mathrm{sg}\!\left[\,\mathrm{LN}(s_y)\,\right]_{B_i} \,\right)
+\mathcal{L} \;=\; \frac{1}{M}\sum_{i=1}^{M}\; \big\lVert\, g_\phi(s_x,\, B_i) \;-\; \mathrm{sg}\!\left[\,s_y\,\right]_{B_i} \,\big\rVert_2^2
 $$
 
 with
@@ -208,7 +208,10 @@ ema_update(tgt_enc, ctx_enc, m)                                         # EMA up
 
 The `with torch.no_grad()` block plus the EMA update give us the stop-gradient $\mathrm{sg}[\cdot]$ — no gradient flows into $f_{\bar\theta}$; it tracks $f_\theta$ by EMA only.
 
-A note on `smooth_l1` versus L2: the paper writes L2 in text, but [the official training script](https://github.com/facebookresearch/ijepa/blob/main/src/train.py) uses `smooth_l1_loss`. We follow the code.
+Two implementation details deviate from the paper's written equation, both following [the official training script](https://github.com/facebookresearch/ijepa/blob/main/src/train.py):
+
+1. **LayerNorm on targets** before the loss. The paper's equation has no LN; the code applies one along the feature dimension for stability.
+2. **`smooth_l1` instead of `L2`**. Same loss family, less sensitive to outliers near the regression target.
 
 ## The training loop
 
