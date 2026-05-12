@@ -34,7 +34,7 @@ The figure shows one video. Top row: the original 8 frames. Middle row: the **co
 
 For each batch:
 
-1. **Pick a subset of objects to mask**, sized 1 or 2 of the 3 objects.
+1. **Pick a subset of objects to mask**, sized 1 or 2 of the 3 objects. (The paper allows the masked set to be empty — e.g., 0–2 objects for Push-T, 0–4 for CLEVRER. We require at least 1 so every step trains the masking branch. The official code seeds its RNG once and masks the same indices each batch; we resample per batch for diversity at our scale.)
 2. **Identity anchor at $t=0$**: the masked objects' slots at $t=0$ are kept visible. This is the only place the model sees their identity.
 3. **History masking**: at $t \in [1, T_{\text{hist}})$ the masked objects' slots become *query tokens* (predict me). Other objects' slots stay visible.
 4. **Future masking**: at $t \geq T_{\text{hist}}$ **all** slots become query tokens. The model must forecast everything.

@@ -124,7 +124,12 @@ $$\mathcal{L}_{\text{tf}} = \frac{1}{T-1} \sum_{t=0}^{T-2} \|f_\psi(z_t, a_{t+1}
 
 $$\mathcal{L}_{\text{roll}} = \frac{1}{K} \sum_{k=1}^{K} \|\hat{z}_k - z_k\|_1, \quad \hat{z}_k = f_\psi(\hat{z}_{k-1}, a_k), \quad \hat{z}_0 = z_0$$
 
-The combined loss is $\mathcal{L} = \mathcal{L}_{\text{tf}} + \lambda \mathcal{L}_{\text{roll}}$ with $\lambda = 0.5$. Teacher forcing trains the one-step dynamics; rollout penalizes error accumulation across multiple steps.
+The combined loss is $\mathcal{L} = \mathcal{L}_{\text{tf}} + \lambda \mathcal{L}_{\text{roll}}$. Teacher forcing trains the one-step dynamics; rollout penalizes error accumulation across multiple steps.
+
+Two notes where this tutorial deviates from the paper:
+
+- $\lambda = 0.5$ here. The paper's Eq. 4 weights the two terms **equally** ($\lambda = 1$); we down-weight rollout for training stability on the toy.
+- We backprop through **$k=4$** rollout steps. The paper differentiates through only one recurrent step (the rollout-loss target is at $T=2$); deeper differentiation is treated as an inference-time concern. Our $k=4$ is more aggressive than the paper's recipe and is a toy-scale choice.
 
 ## Running it
 
