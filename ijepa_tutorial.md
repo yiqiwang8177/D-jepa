@@ -178,19 +178,11 @@ Figure 2 from the I-JEPA paper. The context encoder $f_\theta$ processes context
 
 The paper's objective (Eq. 1) is:
 
-$$
-\mathcal{L} \;=\; \frac{1}{M}\sum_{i=1}^{M} D\!\big(\hat{s}_y(i),\, s_y(i)\big)
-\;=\; \frac{1}{M}\sum_{i=1}^{M}\sum_{j \in B_i} \big\lVert\, \hat{s}_{y_j} - s_{y_j} \,\big\rVert_2^2
-$$
+$$\mathcal{L} = \frac{1}{M} \sum_{i=1}^{M} D(\hat{s}_y(i), s_y(i)) = \frac{1}{M} \sum_{i=1}^{M} \sum_{j \in B_i} \|\hat{s}_{y_j} - s_{y_j}\|_2^2$$
 
 with
 
-$$
-\hat{s}_y(i) = g_\phi(s_x,\, B_i),\qquad
-s_x = f_\theta(x_{\text{context}}),\qquad
-s_y = f_{\bar\theta}(x),\qquad
-\bar\theta \leftarrow m\,\bar\theta + (1-m)\,\theta.
-$$
+$$\hat{s}_y(i) = g_\phi(s_x, B_i), \quad s_x = f_\theta(x_{\text{context}}), \quad s_y = f_{\bar\theta}(x), \quad \bar\theta \leftarrow m \bar\theta + (1-m) \theta$$
 
 Reading the symbols:
 
