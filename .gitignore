@@ -12,8 +12,6 @@ venv/
 
 # Data & artifacts
 data/
-samples/
-papers/
 
 # OMC scratch
 .omc/
