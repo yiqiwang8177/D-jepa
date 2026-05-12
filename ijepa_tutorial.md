@@ -176,15 +176,17 @@ A few details worth noting:
 
 Figure 2 from the I-JEPA paper. The context encoder $f_\theta$ processes context patches; the target encoder $f_{\bar\theta}$ processes the full image; the predictor $g_\phi$ takes context embeddings + target positions and outputs predicted target embeddings; the L2 loss matches predictions against target encoder outputs. Different colors show that $g_\phi$ is called once per target block.
 
-The paper's objective is:
+The paper's objective (Eq. 1) is:
 
 $$
-\mathcal{L} \;=\; \frac{1}{M}\sum_{i=1}^{M}\; \big\lVert\, g_\phi(s_x,\, B_i) \;-\; \mathrm{sg}\!\left[\,s_y\,\right]_{B_i} \,\big\rVert_2^2
+\mathcal{L} \;=\; \frac{1}{M}\sum_{i=1}^{M} D\!\big(\hat{s}_y(i),\, s_y(i)\big)
+\;=\; \frac{1}{M}\sum_{i=1}^{M}\sum_{j \in B_i} \big\lVert\, \hat{s}_{y_j} - s_{y_j} \,\big\rVert_2^2
 $$
 
 with
 
 $$
+\hat{s}_y(i) = g_\phi(s_x,\, B_i),\qquad
 s_x = f_\theta(x_{\text{context}}),\qquad
 s_y = f_{\bar\theta}(x),\qquad
 \bar\theta \leftarrow m\,\bar\theta + (1-m)\,\theta.
@@ -192,12 +194,11 @@ $$
 
 Reading the symbols:
 
-- $f_\theta$ is the **context encoder**. It sees only context patches.
-- $f_{\bar\theta}$ is the **target encoder**, an EMA copy of $f_\theta$.
-- $g_\phi$ is the **predictor**.
-- $B_i$ are the patch indices of the $i$-th target block; $M$ is the number of target blocks (4 in our setup).
-- $\mathrm{LN}$ is LayerNorm along the feature dimension.
-- $\mathrm{sg}[\cdot]$ is stop-gradient — the target encoder gets no gradient from the loss.
+- $f_\theta$ is the **context encoder**; it sees only context patches.
+- $f_{\bar\theta}$ is the **target encoder**, an EMA copy of $f_\theta$ (no gradient).
+- $g_\phi$ is the **predictor**; called once per target block.
+- $B_i$ is the set of patch indices for the $i$-th target block; $M$ is the number of target blocks (4 in our setup).
+- $\hat{s}_{y_j}$ and $s_{y_j}$ are the predicted and target embeddings for patch $j$.
 
 Mapping to the code in `train()`:
 
