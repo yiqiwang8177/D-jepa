@@ -42,6 +42,7 @@ def param_groups(modules, wd):
 
 @torch.no_grad()
 def ema_update(tgt, online, m):
+    # theta_bar <- m * theta_bar + (1 - m) * theta
     for pt, po in zip(tgt.parameters(), online.parameters()): pt.mul_(m).add_(po.detach(), alpha=1 - m)
 
 
@@ -55,7 +56,7 @@ def pick_device():
     return "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-class Encoder(nn.Module):
+class Encoder(nn.Module):                                 # f_theta (context encoder)
     def __init__(self, img_size=32, patch_size=4, in_chans=3, dim=128, depth=6, heads=4):
         super().__init__()
         self.grid = img_size // patch_size; self.n_patches = self.grid ** 2
@@ -76,7 +77,7 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 
-class Predictor(nn.Module):
+class Predictor(nn.Module):                              # g_phi
     def __init__(self, grid, enc_dim=128, dim=64, depth=4, heads=4):
         super().__init__()
         self.in_proj = nn.Linear(enc_dim, dim); self.out_proj = nn.Linear(dim, enc_dim)
@@ -145,11 +146,14 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
             ci = torch.tensor(cl, device=device)
             tis = [torch.tensor(t, device=device) for t in tls]
             for g in opt.param_groups: g["lr"] = lr_warmup_cosine(step, total, lr)
-            with torch.no_grad(): full = F.layer_norm(tgt_enc(imgs), (D,))
-            ce = ctx_enc(imgs, ci)
-            loss = sum(F.smooth_l1_loss(pred(ce, ci, ti),
-                                        full.gather(1, ti.unsqueeze(-1).expand(-1, -1, D)))
-                       for ti in tis) / len(tis)
+            with torch.no_grad(): full = F.layer_norm(tgt_enc(imgs), (D,))  # LN(s_y); no_grad = stop-gradient
+            ce = ctx_enc(imgs, ci)                                          # s_x = f_theta(x_context)
+            loss = sum(
+                F.smooth_l1_loss(
+                    pred(ce, ci, ti),                                       # hat_s_y(i) = g_phi(s_x, B_i)
+                    full.gather(1, ti.unsqueeze(-1).expand(-1, -1, D)))     # [LN(s_y)]_{B_i}
+                for ti in tis                                               # for i in 1..M
+            ) / len(tis)                                                    # (1/M) * sum
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
             ema_update(tgt_enc, ctx_enc, m); losses.append(loss.item())

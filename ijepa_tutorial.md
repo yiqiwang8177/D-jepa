@@ -195,19 +195,19 @@ Reading the symbols:
 Mapping to the code in `train()`:
 
 ```python
-ce = ctx_enc(imgs, ci)                                                 # s_x
 with torch.no_grad():
-    full = F.layer_norm(tgt_enc(imgs), (ctx_enc.dim,))                  # LN(sg(s_y))
+    full = F.layer_norm(tgt_enc(imgs), (D,))                          # LN(s_y); no_grad = stop-gradient
+ce = ctx_enc(imgs, ci)                                                # s_x = f_theta(x_context)
 loss = sum(
     F.smooth_l1_loss(
-        pred(ce, ci, ti),                                               # g_phi(s_x, B_i)
-        full.gather(1, ti.unsqueeze(-1).expand(-1, -1, ctx_enc.dim)))   # [LN(s_y)]_{B_i}
-    for ti in tis
-) / len(tis)
-ema_update(tgt_enc, ctx_enc, m)                                         # EMA update of theta_bar
+        pred(ce, ci, ti),                                             # hat_s_y(i) = g_phi(s_x, B_i)
+        full.gather(1, ti.unsqueeze(-1).expand(-1, -1, D)))           # [LN(s_y)]_{B_i}
+    for ti in tis                                                     # for i in 1..M
+) / len(tis)                                                          # (1/M) * sum
+ema_update(tgt_enc, ctx_enc, m)                                       # theta_bar <- m*theta_bar + (1-m)*theta
 ```
 
-The `with torch.no_grad()` block plus the EMA update give us the stop-gradient $\mathrm{sg}[\cdot]$ — no gradient flows into $f_{\bar\theta}$; it tracks $f_\theta$ by EMA only.
+The `with torch.no_grad()` block plus the EMA update implement the stop-gradient: no gradient flows into $f_{\bar\theta}$; it tracks $f_\theta$ by EMA only.
 
 Two implementation details deviate from the paper's written equation, both following [the official training script](https://github.com/facebookresearch/ijepa/blob/main/src/train.py):
 
