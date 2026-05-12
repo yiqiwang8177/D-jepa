@@ -1,0 +1,38 @@
+[project]
+name = "jepa"
+version = "0.1.0"
+description = "Minimal, single-file PyTorch reimplementations of the JEPA family (I-JEPA, V-JEPA, V-JEPA 2, C-JEPA) with paired tutorials."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Keon Kim" }]
+keywords = ["self-supervised-learning", "vision", "video", "jepa", "pytorch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "matplotlib==3.10.9",
+    "scikit-learn==1.8.0",
+    "numpy==2.4.4",
+    "pillow==12.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/keon/jepa"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "ijepa", "ijepa_extras",
+    "vjepa", "vjepa_extras",
+    "vjepa2", "vjepa2_extras",
+    "cjepa", "cjepa_extras",
+]
