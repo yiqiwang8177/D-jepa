@@ -264,11 +264,11 @@ The standard sanity check for a self-supervised method is a *linear probe*: free
 
 On CIFAR-10, a linear probe over the EMA target encoder reached **52.7% test accuracy** with 3 probe epochs after 100 epochs of pretraining. (At 8 epochs the probe gives ~35%; the gap to 52% comes from more training time on the same tiny ViT.) A supervised baseline with the same architecture and training budget reaches above 70%. The full gap to the I-JEPA paper's numbers is expected — the paper trains ViT-Huge on ImageNet for 300 epochs. The point of this implementation is the algorithm shape, not the leaderboard.
 
-To see the learning visually, we snapshot test-set features after every 10th epoch and project them with t-SNE:
+To see the learning visually, we snapshot test-set features after every 10th epoch and project them with LDA — the 2D direction pair that maximizes between-class over within-class variance, i.e., the best linear view of class separability:
 
-![t-SNE evolution](./samples/ijepa_tsne_evolution.png)
+![LDA evolution](./samples/ijepa_lda_evolution.png)
 
-The init panel (random encoder) shows a featureless point cloud. By epoch 9 distinct local clusters are forming. By epoch 99 those clusters are partially class-coherent — regions where one color dominates — even though the encoder never saw a class label. That is what self-supervised learning looks like when it works.
+The init panel (random encoder) shows an overlapping mixture with no class structure. By epoch 29 a "comet" shape forms — some classes start pulling out to one side. By epoch 99 there is visible color clustering along the projection axes. The encoder learned class-relevant structure without ever seeing a class label.
 
 ## What's next
 
