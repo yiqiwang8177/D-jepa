@@ -168,21 +168,47 @@ A few details worth noting:
 
 ## The loss
 
-For every batch, we do four things:
+The objective is:
 
-1. Run the target encoder over the full image. Apply LayerNorm to the output.
-2. Gather embeddings at target positions — these are the regression targets.
-3. Run the context encoder over context patches; pass its output and target positions through the predictor.
-4. Compute smooth-L1 loss between predictor outputs and the LayerNorm'd target embeddings.
+$$
+\mathcal{L} \;=\; \frac{1}{M}\sum_{i=1}^{M}\; \mathrm{smooth\_l1}\!\left(\, g_\phi(s_x,\, B_i),\; \mathrm{sg}\!\left[\,\mathrm{LN}(s_y)\,\right]_{B_i} \,\right)
+$$
 
+with
+
+$$
+s_x = f_\theta(x_{\text{context}}),\qquad
+s_y = f_{\bar\theta}(x),\qquad
+\bar\theta \leftarrow m\,\bar\theta + (1-m)\,\theta.
+$$
+
+Reading the symbols:
+
+- $f_\theta$ is the **context encoder**. It sees only context patches.
+- $f_{\bar\theta}$ is the **target encoder**, an EMA copy of $f_\theta$.
+- $g_\phi$ is the **predictor**.
+- $B_i$ are the patch indices of the $i$-th target block; $M$ is the number of target blocks (4 in our setup).
+- $\mathrm{LN}$ is LayerNorm along the feature dimension.
+- $\mathrm{sg}[\cdot]$ is stop-gradient — the target encoder gets no gradient from the loss.
+
+Mapping to the code in `train()`:
+
+```python
+ce = ctx_enc(imgs, ci)                                                 # s_x
+with torch.no_grad():
+    full = F.layer_norm(tgt_enc(imgs), (ctx_enc.dim,))                  # LN(sg(s_y))
+loss = sum(
+    F.smooth_l1_loss(
+        pred(ce, ci, ti),                                               # g_phi(s_x, B_i)
+        full.gather(1, ti.unsqueeze(-1).expand(-1, -1, ctx_enc.dim)))   # [LN(s_y)]_{B_i}
+    for ti in tis
+) / len(tis)
+ema_update(tgt_enc, ctx_enc, m)                                         # EMA update of theta_bar
 ```
-loss = smooth_l1( predictor(context_embeddings, target_positions),
-                  LayerNorm( target_encoder(image) )[target_positions] )
-```
 
-A note on `smooth_l1` versus L2: the paper says L2 in the text, but [the official training script](https://github.com/facebookresearch/ijepa/blob/main/src/train.py) uses `smooth_l1_loss`. We follow the code.
+The `with torch.no_grad()` block plus the EMA update give us the stop-gradient $\mathrm{sg}[\cdot]$ — no gradient flows into $f_{\bar\theta}$; it tracks $f_\theta$ by EMA only.
 
-The gradient flows back through the context encoder and predictor. The target encoder is updated by EMA only.
+A note on `smooth_l1` versus L2: the paper writes L2 in text, but [the official training script](https://github.com/facebookresearch/ijepa/blob/main/src/train.py) uses `smooth_l1_loss`. We follow the code.
 
 ## The training loop
 
