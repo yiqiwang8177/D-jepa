@@ -15,6 +15,7 @@ data/
 
 # OMC scratch
 .omc/
+.claude/
 
 # Editor
 *.swp

@@ -8,6 +8,7 @@ Minimal, single-file PyTorch reimplementations of the JEPA family, with paired t
 | [`vjepa.py`](./vjepa.py) | V-JEPA | Moving MNIST | 188 | [`vjepa_tutorial.md`](./vjepa_tutorial.md) |
 | [`vjepa2.py`](./vjepa2.py) | V-JEPA 2 + V-JEPA 2-AC | synthetic moving digits | 278 | [`vjepa2_tutorial.md`](./vjepa2_tutorial.md) |
 | [`cjepa.py`](./cjepa.py) | C-JEPA | 3-digit bouncing video | 174 | [`cjepa_tutorial.md`](./cjepa_tutorial.md) |
+| [`leworldmodel.py`](./leworldmodel.py) | LeWorldModel | synthetic moving digit | 233 | [`leworldmodel_tutorial.md`](./leworldmodel_tutorial.md) |
 
 Each algorithm file is **standalone** — only depends on `torch` and `torchvision`, no shared utilities. The matching `<algo>_extras.py` adds visualization (mask grids, loss curves, PCA/LDA/t-SNE evolution, linear probe).
 
@@ -49,14 +50,16 @@ pip install -e .
 
 ```
 .
-├── ijepa.py / ijepa_extras.py           # I-JEPA on CIFAR-10
-├── vjepa.py / vjepa_extras.py           # V-JEPA on Moving MNIST
-├── vjepa2.py / vjepa2_extras.py         # V-JEPA 2 + V-JEPA 2-AC (synthetic)
-├── cjepa.py / cjepa_extras.py           # C-JEPA on 3-digit bouncing video
-├── ijepa_tutorial.md                    # walk-throughs that match the code
+├── ijepa.py / ijepa_extras.py                       # I-JEPA on CIFAR-10
+├── vjepa.py / vjepa_extras.py                       # V-JEPA on Moving MNIST
+├── vjepa2.py / vjepa2_extras.py                     # V-JEPA 2 + V-JEPA 2-AC (synthetic)
+├── cjepa.py / cjepa_extras.py                       # C-JEPA on 3-digit bouncing video
+├── leworldmodel.py / leworldmodel_extras.py         # LeWorldModel (end-to-end JEPA, SIGReg)
+├── ijepa_tutorial.md                                # walk-throughs that match the code
 ├── vjepa_tutorial.md
 ├── vjepa2_tutorial.md
 ├── cjepa_tutorial.md
+├── leworldmodel_tutorial.md
 ├── papers/                              # the four source PDFs
 ├── samples/                             # mask grids, loss curves, PCA/LDA/t-SNE plots
 └── figs/                                # paper figures referenced by tutorials
@@ -71,6 +74,8 @@ pip install -e .
 **V-JEPA 2** ([Assran et al. 2025](https://arxiv.org/abs/2506.09985)) — two-phase: V-JEPA pretraining followed by **V-JEPA 2-AC**, an action-conditioned predictor trained on frozen-encoder latents with teacher forcing + rollout. The encoder is frozen in phase 2; no EMA.
 
 **C-JEPA** ([Nam et al. 2026](https://arxiv.org/abs/2602.11389)) — object-level trajectory masking with an identity anchor at $t=0$. No EMA. Bidirectional transformer over flattened slot tokens. Built on top of a pretrained object-centric encoder (VideoSAUR in the paper; we use a frozen embedding lookup as a documented stand-in).
+
+**LeWorldModel** ([Maes et al. 2026](https://arxiv.org/abs/2603.19312)) — end-to-end JEPA world model from pixels. No EMA, no stop-grad, no masking. The encoder and an action-conditioned AR predictor are jointly trained with two loss terms: next-embedding MSE plus a Sketch Isotropic Gaussian Regularizer (SIGReg) that prevents collapse by pushing the embedding marginals toward $\mathcal{N}(0, 1)$.
 
 ## Caveats
 
