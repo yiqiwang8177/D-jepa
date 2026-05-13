@@ -30,6 +30,12 @@ Each video is 8 frames long. We split it into a **history window** of 5 frames a
 
 The figure shows one video. Top row: the original 8 frames. Middle row: the **context** — the t=0 anchor frame is fully visible, but the masked object's cell is blanked out at t=1..4, and the entire future (t=5..7) is hidden. Bottom row: the **targets** — at t=1..4 only the masked object is shown, and the entire future is visible.
 
+Animated, the structure pops:
+
+![C-JEPA masking animated](./samples/cjepa_masks.gif)
+
+At `t=0 *anchor*` everything is visible. At `t=1..4` the context loses the masked object's cell at each step (you can see it appear in the targets pane instead). At `t=5..7 *future*` the context is entirely black — the predictor must forecast all three objects' positions.
+
 ## The masking recipe
 
 For each batch:
@@ -174,6 +180,24 @@ The headline diagnostic: full-context loss vs anchor-only loss. If the gap is po
 In our 4-epoch run the gap reaches **+0.20 to +0.34 by epoch 7**: the anchor-only ablation lands 20–35% above the full-context loss. The model genuinely needs the other slots' trajectories to predict the masked object's path — exactly what C-JEPA's masking strategy is designed to elicit.
 
 This is the C-JEPA signature: a clean, growing gap that says "inter-object information is being used". Patch-JEPA on the same data would not produce this gap because patch-level masking can be solved by local interpolation.
+
+## Core insights
+
+Five things C-JEPA gets right, in roughly the order they matter:
+
+1. **Mask the object, not the patch.** Patch masking lets the model interpolate textures from neighbors — a low-information task. Hiding an entire object's trajectory removes that shortcut and forces the model to reason about *which object is where* and *how it interacts with others*.
+
+2. **Identity anchor at $t=0$, no slot positional encoding.** Slot order is arbitrary (Slot Attention is permutation-equivariant), so the model can't ground identity in a slot index. Instead, the only place the masked object's identity appears is the anchor projection $\phi(z_0^{(k)})$ added to each query token. The model has to track identity across time using only that one cue.
+
+3. **Predict both history and future.** $\mathcal{L}_{\text{hist}}$ is recovery (fill in what you can't see); $\mathcal{L}_{\text{fut}}$ is forecasting (predict what hasn't happened). Together they make the predictor a temporal model in both directions, not just a forward simulator.
+
+4. **The encoder is already frozen — no EMA needed.** Slot discovery happens *before* C-JEPA training (VideoSAUR on frozen DINOv2). By the time the C-JEPA predictor starts learning, the encoder is fixed. There's no representation collapse to prevent because there's nothing for the encoder to collapse into.
+
+5. **Interaction is the signal.** The anchor-only ablation directly measures how much the other objects' trajectories help. On data with real interactions (our bouncing digits with elastic collisions, the paper's CLEVRER physics) the gap grows steadily. On data with independent objects, the gap stays at zero — and that's diagnostic, not a bug.
+
+What we don't reproduce here: the **slot discovery** prerequisite. Real C-JEPA needs an object-centric encoder trained for ~100k steps before C-JEPA training even starts. Our embedding-lookup stand-in skips that step by reading oracle positions from the simulator; everything downstream of slot extraction is faithful.
+
+## What's next
 
 ## Hyperparameters
 
