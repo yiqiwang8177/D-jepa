@@ -1,6 +1,6 @@
-# V-JEPA from Scratch in 188 Lines of PyTorch
+# V-JEPA from Scratch in 194 Lines of PyTorch
 
-This post extends [the I-JEPA tutorial](./ijepa_tutorial.md) to video. We'll implement **V-JEPA** — the video version of I-JEPA — and train it on Moving MNIST in **about 188 lines of PyTorch**.
+This post extends [the I-JEPA tutorial](./ijepa_tutorial.md) to video. We'll implement **V-JEPA** — the video version of I-JEPA — and train it on Moving MNIST in **about 194 lines of PyTorch**.
 
 - Source: [`vjepa.py`](./vjepa.py)
 - Paper: Bardes et al., *V-JEPA: Latent Video Prediction for Visual Representation Learning* ([arXiv 2404.08471](https://arxiv.org/abs/2404.08471))
@@ -69,6 +69,7 @@ class VideoEncoder(nn.Module):                          # f_theta (context encod
         self.t_grid = num_frames // t_patch              # 10 / 2 = 5 temporal slices
         self.s_grid = img_size // patch_size             # 64 / 16 = 4x4 spatial grid
         self.n_patches = self.t_grid * self.s_grid * self.s_grid       # 5*4*4 = 80 tokens
+        self.t_patch = t_patch; self.patch_size = patch_size; self.dim = dim
         self.tubelet_proj = nn.Conv3d(                   # (t_patch, patch, patch) kernel
             in_chans, dim,
             kernel_size=(t_patch, patch_size, patch_size),
@@ -104,38 +105,29 @@ The mask sampler runs once per batch and produces two groups:
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7)]    # (label, n_blocks, spatial_scale)
 
 def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5)):
-    sg2 = s_grid * s_grid; all_idx = set(range(t_grid * sg2))
+    rng = rng or random
+    min_visible_cells = max(1, math.ceil(min_ctx / t_grid))
     groups = []
     for label, n_blocks, scale in MASK_GROUPS:
-        eff_scale = min(scale, 0.5) if s_grid < 8 and scale > 0.5 else scale
-                                                         # cap 0.7 on tiny grids
-        h, w = _bsize(s_grid, eff_scale, rng.uniform(*ar_range))   # spatial block shape
-        cs, ps = [], []
-        for _ in range(B):                               # per-item locations
-            tubes = set()
-            for _ in range(n_blocks):                    # 8 (short) or 2 (long)
-                top, left = rng.randint(0, s_grid - h), rng.randint(0, s_grid - w)
-                for t in range(t_grid):                  # tube: same (r,c) at every t
-                    for r in range(top, top + h):
-                        for c in range(left, left + w):
-                            tubes.add(t * sg2 + r * s_grid + c)
-            ctx = all_idx - tubes                        # context = everything except tubes
-            if len(ctx) < min_ctx:                       # rebalance if tubes covered too much
-                for p in sorted(tubes)[:min_ctx - len(ctx)]:
-                    tubes.discard(p); ctx.add(p)
-            cs.append(sorted(ctx)); ps.append(sorted(tubes))
-        Lc, Lp = min(len(c) for c in cs), min(len(p) for p in ps)
+        h, w = _bsize(s_grid, scale, rng.uniform(*ar_range))
+        ctx_spatial, pred_spatial = [], []
+        for _ in range(B):
+            masked, visible = _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells)
+            ctx_spatial.append(sorted(visible))
+            pred_spatial.append(sorted(masked))
+
+        # Keep batch tensors rectangular without breaking the tube property:
+        # trim whole spatial cells, then expand every selected cell across all time steps.
+        Lc, Lp = min(len(c) for c in ctx_spatial), min(len(p) for p in pred_spatial)
         groups.append({
             "label": label, "n_blocks": n_blocks, "block_hw": (h, w),
-            "ctx": [sorted(rng.sample(c, Lc)) for c in cs],   # random subsample to trim
-            "pred": [sorted(rng.sample(p, Lp)) for p in ps],
+            "ctx": [_expand_tubes(sorted(rng.sample(c, Lc)), t_grid, s_grid) for c in ctx_spatial],
+            "pred": [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial],
         })
     return groups
 ```
 
-The "tube" structure comes from the nested loop: `for t in range(t_grid)` runs over every temporal slice, while `(r, c)` are fixed. The same spatial cells are masked at every timestep.
-
-The auto-cap (`eff_scale = min(scale, 0.5)`) handles our tiny 4×4 spatial grid. The paper's 0.7 long-range scale would leave no context patches at our size; we cap to 0.5. On the paper's native 14×14 grids the cap doesn't trigger.
+The "tube" structure comes from sampling spatial cells first and expanding each selected cell across every temporal slice. The sampler never moves target tokens back into context; if it must trim for rectangular batch tensors, it trims whole spatial tubes rather than individual tokens. On the tiny Moving-MNIST grid this is still a toy approximation of the paper's large-grid masking, but the key invariant — same spatial footprint over time — is preserved.
 
 ## The loss
 
@@ -203,7 +195,7 @@ def train(epochs=5, batch_size=32, lr=3e-4, wd=0.05,
 - **Batch size** — `32` (videos are bigger than CIFAR images).
 - **Epochs** — `5`.
 - **EMA momentum** — `0.998 → 1.0` linear. Matches the `vitl16.yaml` reference config.
-- **Mask groups** — `[("short", 8, 0.15), ("long", 2, 0.7)]`. Long-scale auto-capped to 0.5 when `s_grid < 8`.
+- **Mask groups** — `[("short", 8, 0.15), ("long", 2, 0.7)]`. Long scale stays `0.7`; the sampler trims whole spatial tubes only when needed for rectangular batches.
 - **Encoder** — ViT-tiny: dim 128, depth 6, heads 4. Tubelet `(2, 16, 16)`.
 - **Predictor** — dim 64, depth 4, heads 4.
 

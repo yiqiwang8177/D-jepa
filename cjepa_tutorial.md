@@ -1,6 +1,6 @@
-# C-JEPA from Scratch in 174 Lines of PyTorch
+# C-JEPA from Scratch in 162 Lines of PyTorch
 
-This post implements **Causal-JEPA** — JEPA's object-centric variant — in **about 174 lines of PyTorch**. C-JEPA's headline contribution is **object-level trajectory masking with an identity anchor**: hide one object's representation across the entire history except for a single anchor frame, and predict it from the other objects' trajectories.
+This post implements **Causal-JEPA** — JEPA's object-centric variant — in **about 162 lines of PyTorch**. C-JEPA's headline contribution is **object-level trajectory masking with an identity anchor**: hide one object's representation across the entire history except for a single anchor frame, and predict it from the other objects' trajectories.
 
 - Source: [`cjepa.py`](./cjepa.py)
 - Paper: Nam et al., *Causal-JEPA: Learning World Models through Object-Level Latent Interventions* ([arXiv 2602.11389](https://arxiv.org/abs/2602.11389))
@@ -18,7 +18,7 @@ C-JEPA is built on top of a **pretrained object-centric encoder**. The real pape
 We generate 3-digit videos on a 4×4 cell grid:
 
 - Three MNIST digits, each occupies one 8×8 cell.
-- Each digit has integer velocity in $\{-1, 0, +1\}^2$.
+- Each digit has integer velocity in $\{-1, +1\}^2$.
 - Digits bounce off walls.
 - **Pairwise elastic collisions**: if two digits would land on the same cell, they swap velocities and stay put for that step.
 
@@ -58,12 +58,10 @@ Critically, there's **no positional embedding along the entity dimension**. Slot
 ## The frozen slot extractor (educational shortcut)
 
 ```python
-class FrozenSlotEncoder(nn.Module):                      # stand-in for VideoSAUR
-    """Frozen random per-cell embedding -- slot features come from positions only."""
-
+class FrozenSlotEncoder(nn.Module):                      # oracle stand-in for VideoSAUR/SAVi
     def __init__(self, dim=SLOT_DIM, n_cells=GRID * GRID):
         super().__init__()
-        self.embed = nn.Embedding(n_cells, dim)          # 16 cells x dim
+        self.dim = dim; self.embed = nn.Embedding(n_cells, dim)  # 16 cells x dim
         nn.init.normal_(self.embed.weight, std=1.0)
         for p in self.parameters(): p.requires_grad_(False)  # frozen
 
@@ -72,7 +70,7 @@ class FrozenSlotEncoder(nn.Module):                      # stand-in for VideoSAU
         return self.embed(slot_idx)                      # (B, T, K, dim) -- pure lookup
 ```
 
-Real C-JEPA uses VideoSAUR — slot attention on top of frozen DINOv2 patch features, trained for ~100k steps on slot reconstruction. Our cheat: since the synthetic data tells us exactly which grid cell each digit occupies at each timestep, we use a frozen random embedding indexed by the cell number. The "encoder" is a lookup table.
+Real C-JEPA uses VideoSAUR — slot attention on top of frozen DINOv2 patch features, trained for ~100k steps on slot reconstruction. Our cheat: since the synthetic data tells us exactly which grid cell each digit occupies at each timestep, we use a frozen oracle embedding indexed by the cell number. The "encoder" is a lookup table over simulator-provided positions, so it demonstrates C-JEPA's masking objective rather than object discovery.
 
 This is honest about what we're skipping: **slot discovery**. C-JEPA's masking and prediction logic — the part we *are* reproducing — runs on top of whatever the slot extractor produces. Whether those slots come from VideoSAUR or from oracle positions doesn't change the predictor.
 
@@ -88,6 +86,7 @@ class MaskedSlotPredictor(nn.Module):                    # g_phi (bidirectional 
         self.register_buffer("time_pe", sincos_1d(T, dim))
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.to_out = nn.Linear(dim, dim)
 
     def forward(self, slots, mask_indices, ablate_to_anchor_only=False):
         B = slots.size(0)
@@ -104,7 +103,7 @@ class MaskedSlotPredictor(nn.Module):                    # g_phi (bidirectional 
         x = torch.where(is_q[None, :, :, None], query, real).reshape(B, T * K, self.dim)
                                                          # mix real & query, flatten to (B, T*K, D)
         for blk in self.blocks: x = blk(x)               # bidirectional attention
-        return self.norm(x).view(B, T, K, self.dim)
+        return self.to_out(self.norm(x)).view(B, T, K, self.dim)
 ```
 
 A few things worth noting:
@@ -177,7 +176,7 @@ The headline diagnostic: full-context loss vs anchor-only loss. If the gap is po
 
 ![C-JEPA interaction gap](./samples/cjepa_interaction_gap.png)
 
-In our 4-epoch run the gap reaches **+0.20 to +0.34 by epoch 7**: the anchor-only ablation lands 20–35% above the full-context loss. The model genuinely needs the other slots' trajectories to predict the masked object's path — exactly what C-JEPA's masking strategy is designed to elicit.
+In the sample run, the gap becomes clearly positive: the anchor-only ablation lands noticeably above the full-context loss. The model genuinely needs the other slots' trajectories to predict the masked object's path — exactly what C-JEPA's masking strategy is designed to elicit.
 
 This is the C-JEPA signature: a clean, growing gap that says "inter-object information is being used". Patch-JEPA on the same data would not produce this gap because patch-level masking can be solved by local interpolation.
 
@@ -197,12 +196,10 @@ Five things C-JEPA gets right, in roughly the order they matter:
 
 What we don't reproduce here: the **slot discovery** prerequisite. Real C-JEPA needs an object-centric encoder trained for ~100k steps before C-JEPA training even starts. Our embedding-lookup stand-in skips that step by reading oracle positions from the simulator; everything downstream of slot extraction is faithful.
 
-## What's next
-
 ## Hyperparameters
 
-- **Encoder**: frozen `nn.Embedding(16, 128)` over the 4×4 cell grid (stand-in for VideoSAUR).
-- **Predictor**: dim 128, depth 4, heads 4. Bidirectional attention.
+- **Encoder**: frozen `nn.Embedding(16, 128)` over the 4×4 cell grid (oracle position-slot stand-in for VideoSAUR/SAVi).
+- **Predictor**: dim 128, depth 4, heads 4. Bidirectional attention plus output projection head.
 - **Time positional encoding**: 1D sin-cos over 8 timesteps. No slot positional encoding.
 - **Mask budget**: 1 or 2 of 3 objects per batch.
 - **History / forecast split**: $T_h = 5$, $T_f = 3$.

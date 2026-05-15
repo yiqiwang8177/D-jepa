@@ -1,7 +1,7 @@
 [project]
 name = "jepa"
 version = "0.1.0"
-description = "Minimal, single-file PyTorch reimplementations of the JEPA family (I-JEPA, V-JEPA, V-JEPA 2, C-JEPA) with paired tutorials."
+description = "Minimal, single-file PyTorch reimplementations of the JEPA family (I-JEPA, V-JEPA, V-JEPA 2, C-JEPA, LeWorldModel) with paired tutorials."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -35,4 +35,5 @@ py-modules = [
     "vjepa", "vjepa_extras",
     "vjepa2", "vjepa2_extras",
     "cjepa", "cjepa_extras",
+    "leworldmodel", "leworldmodel_extras",
 ]

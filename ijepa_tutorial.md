@@ -1,6 +1,6 @@
 # I-JEPA: Self-Supervised Learning Without Reconstructing Pixels
 
-This post walks through **I-JEPA**, a self-supervised method for learning image representations, and implements it from scratch on CIFAR-10 in **about 160 lines of PyTorch**.
+This post walks through **I-JEPA**, a self-supervised method for learning image representations, and implements it from scratch on CIFAR-10 in **about 165 lines of PyTorch**.
 
 - Source: [`ijepa.py`](./ijepa.py)
 - Paper: Assran et al., *Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture* ([arXiv 2301.08243](https://arxiv.org/abs/2301.08243))
@@ -68,22 +68,24 @@ A standard Vision Transformer. Patches go through a 2D convolution that produces
 
 ```python
 class Encoder(nn.Module):                                # f_theta (context encoder)
-    def __init__(self, img_size=32, patch_size=4, dim=128, depth=6, heads=4):
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, dim=128, depth=6, heads=4):
         super().__init__()
-        self.grid = img_size // patch_size               # 32 / 4 = 8 -> 8x8 patch grid
-        self.patch_proj = nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size)
-                                                         # patchify + linear-embed in one Conv2d
+        self.grid = img_size // patch_size; self.n_patches = self.grid ** 2
+        self.dim = dim; self.patch_size = patch_size; self.img_size = img_size
+        self.patch_proj = nn.Conv2d(in_chans, dim, kernel_size=patch_size, stride=patch_size)
         self.register_buffer("pos", sincos_2d(self.grid, self.grid, dim))
-                                                         # fixed 2D sin-cos positional embedding
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
 
     def forward(self, imgs, idx=None):
-        tokens = self.patch_proj(imgs).flatten(2).transpose(1, 2)   # (B, 64, dim) patch embeddings
-        if idx is not None:                              # idx -> encode only these patches
-            tokens = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, tokens.size(-1)))
-        x = tokens + self.pos[idx if idx is not None else torch.arange(tokens.size(1))]
-        for blk in self.blocks: x = blk(x)               # ViT self-attention stack
+        tokens = self.patch_proj(imgs).flatten(2).transpose(1, 2)   # (B, 64, dim)
+        B, N, D = tokens.shape
+        if idx is None:
+            idx = torch.arange(N, device=imgs.device).expand(B, -1)
+            x = tokens + self.pos[idx]
+        else:
+            x = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, D)) + self.pos[idx]
+        for blk in self.blocks: x = blk(x)
         return self.norm(x)
 ```
 
@@ -149,21 +151,22 @@ The mask sampler picks block sizes once per batch and block locations per image:
 
 ```python
 def sample_ijepa_masks(B, grid, n_targets=4, min_ctx=4, rng=None):
-    th, tw = _bsize(grid, rng.uniform(0.15, 0.20), rng.uniform(0.75, 1.5))  # target block shape (shared)
-    ch, cw = _bsize(grid, rng.uniform(0.85, 1.0), 1.0)                      # context block shape (shared)
-    ctx_list, tgt_lists = [None] * B, [[None] * B for _ in range(n_targets)]
+    rng = rng or random
+    th, tw = _bsize(grid, rng.uniform(0.15, 0.20), rng.uniform(0.75, 1.5))
+    ch, cw = _bsize(grid, rng.uniform(0.85, 1.0), 1.0)
+    ctx_list = [None] * B; tgt_lists = [[None] * B for _ in range(n_targets)]
     for b in range(B):                                   # per-item: sample LOCATIONS
-        ts = [_block(grid, rng.randint(0, grid - th), rng.randint(0, grid - tw),
-                     th, tw) for _ in range(n_targets)]  # 4 target blocks at random positions
-        for m, t in enumerate(ts):
-            tgt_lists[m][b] = sorted(t)
-        for _ in range(10):                              # retry context placement up to 10 times
-            ctx = _block(grid, rng.randint(0, grid - ch), rng.randint(0, grid - cw),
-                         ch, cw) - set().union(*ts)      # remove target patches from context
-            if len(ctx) >= min_ctx: break
-        ctx_list[b] = sorted(ctx) if ctx else [0]
-    L = min(len(c) for c in ctx_list)                    # batch-wide min context length
-    return [sorted(rng.sample(c, L)) for c in ctx_list], tgt_lists  # random subsample to trim
+        ts = []
+        for m in range(n_targets):
+            top, left = rng.randint(0, grid - th), rng.randint(0, grid - tw)
+            t = _block(grid, top, left, th, tw); ts.append(t); tgt_lists[m][b] = sorted(t)
+        for _ in range(10):
+            ct, cl = rng.randint(0, grid - ch), rng.randint(0, grid - cw)
+            c = _block(grid, ct, cl, ch, cw) - set().union(*ts)
+            if len(c) >= min_ctx: break
+        ctx_list[b] = sorted(c) if c else [0]
+    L = min(len(c) for c in ctx_list)
+    return [sorted(rng.sample(c, L)) for c in ctx_list], tgt_lists
 ```
 
 A few details worth noting:

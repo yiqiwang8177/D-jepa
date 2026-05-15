@@ -1,10 +1,4 @@
-"""V-JEPA on Moving MNIST. Viz in vjepa_extras.py.
-
-Faithful: 3D tubelet encoder + full EMA copy; 3D sin-cos pos (1D-t + 2D-s);
-two mask groups (short 8x0.15 + long 2x0.7, long capped to 0.5 on tiny grids);
-tubes span full temporal axis; per-item locations, random-subsample trim;
-L1 on LN'd targets; EMA 0.998->1.0; WD split.
-"""
+"""Minimal V-JEPA: tubelet encoder, EMA target, short/long full-time tube masks, L1 loss."""
 import copy, math, random
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -125,29 +119,41 @@ def _bsize(g, s, ar=1.0):
     return (max(1, min(g, round(math.sqrt(a * ar)))), max(1, min(g, round(math.sqrt(a / ar)))))
 
 
+def _expand_tubes(spatial_cells, t_grid, s_grid):
+    return sorted(t * s_grid * s_grid + p for t in range(t_grid) for p in spatial_cells)
+
+
+def _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells):
+    all_spatial = set(range(s_grid * s_grid))
+    best = None
+    for _ in range(50):
+        masked = set()
+        for _ in range(n_blocks):
+            top, left = rng.randint(0, s_grid - h), rng.randint(0, s_grid - w)
+            masked.update(r * s_grid + c for r in range(top, top + h) for c in range(left, left + w))
+        visible = all_spatial - masked
+        if best is None or len(visible) > len(best[1]):
+            best = (masked, visible)
+        if len(visible) >= min_visible_cells:
+            return masked, visible
+    return best
+
+
 def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5)):
-    rng = rng or random; sg2 = s_grid * s_grid; all_idx = set(range(t_grid * sg2))
+    rng = rng or random
+    min_visible_cells = max(1, math.ceil(min_ctx / t_grid))
     groups = []
     for label, n_blocks, scale in MASK_GROUPS:
-        es = min(scale, 0.5) if s_grid < 8 and scale > 0.5 else scale
-        h, w = _bsize(s_grid, es, rng.uniform(*ar_range))
-        cs, ps = [], []
+        h, w = _bsize(s_grid, scale, rng.uniform(*ar_range))
+        ctx_spatial, pred_spatial = [], []
         for _ in range(B):
-            tubes = set()
-            for _ in range(n_blocks):
-                top, left = rng.randint(0, s_grid - h), rng.randint(0, s_grid - w)
-                for t in range(t_grid):
-                    for r in range(top, top + h):
-                        for c in range(left, left + w):
-                            tubes.add(t * sg2 + r * s_grid + c)
-            ctx = all_idx - tubes
-            if len(ctx) < min_ctx:
-                for p in sorted(tubes)[:min_ctx - len(ctx)]: tubes.discard(p); ctx.add(p)
-            cs.append(sorted(ctx)); ps.append(sorted(tubes))
-        Lc, Lp = min(len(c) for c in cs), min(len(p) for p in ps)
+            masked, visible = _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells)
+            ctx_spatial.append(sorted(visible)); pred_spatial.append(sorted(masked))
+        Lc, Lp = min(len(c) for c in ctx_spatial), min(len(p) for p in pred_spatial)
+        ctx = [_expand_tubes(sorted(rng.sample(c, Lc)), t_grid, s_grid) for c in ctx_spatial]
+        pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
         groups.append({"label": label, "n_blocks": n_blocks, "block_hw": (h, w),
-                       "ctx": [sorted(rng.sample(c, Lc)) for c in cs],
-                       "pred": [sorted(rng.sample(p, Lp)) for p in ps]})
+                       "ctx": ctx, "pred": pred})
     return groups
 
 

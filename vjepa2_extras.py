@@ -47,18 +47,17 @@ def save_phase1_masks(video, ctx_idx, pred_idx, label, encoder, path, n_frames_s
 
 
 @torch.no_grad()
-def save_rollout_demo(encoder, ac, video, actions, path):
-    """actions: (B, T-1, action_dim) -- per-step accelerations."""
+def save_rollout_demo(encoder, ac, video, actions, states, path):
+    """actions/states: (B, T, 2) per-tubelet velocity and normalized position."""
     B = video.size(0)
     z = encoder(video).view(B, encoder.t_grid, encoder.s_grid ** 2, -1)
     T = encoder.t_grid
-    roll = z[:, 0]; roll_z = z[:, 0]
-    err_roll, err_zero = [], []
-    for t in range(T - 1):
-        roll = ac.step(roll, actions[:, t + 1])
-        roll_z = ac.step(roll_z, torch.zeros_like(actions[:, t + 1]))
-        err_roll.append((roll - z[:, t + 1]).abs().mean().item())
-        err_zero.append((roll_z - z[:, t + 1]).abs().mean().item())
+    rollout_actions = actions[:, 1:T]
+    rollout_states = states[:, :T - 1]
+    rolled = ac.rollout(z[:, 0], rollout_actions, rollout_states)
+    rolled_zero = ac.rollout(z[:, 0], torch.zeros_like(rollout_actions), rollout_states)
+    err_roll = [(rolled[:, t] - z[:, t + 1]).abs().mean().item() for t in range(T - 1)]
+    err_zero = [(rolled_zero[:, t] - z[:, t + 1]).abs().mean().item() for t in range(T - 1)]
     plt.figure(figsize=(6, 3.5))
     plt.plot(range(1, T), err_roll, marker="o", label="with action")
     plt.plot(range(1, T), err_zero, marker="x", label="action=0")
@@ -110,7 +109,7 @@ def main(phase1_epochs=3, phase2_epochs=4):
     out = _main(phase1_epochs=phase1_epochs, phase2_epochs=phase2_epochs)
 
     # phase-1 mask snapshot
-    videos, actions = next(iter(out["loader"]))
+    videos, actions, states = next(iter(out["loader"]))
     encoder = out["encoder"]
     groups = sample_vjepa_masks(videos.size(0), encoder.t_grid, encoder.s_grid,
                                  rng=random.Random(42))
@@ -121,8 +120,8 @@ def main(phase1_epochs=3, phase2_epochs=4):
                           f"{SAMPLES_DIR}/vjepa2_phase1_masks_{g['label']}.png")
 
     # AC rollout demo
-    videos = videos.to(out["device"]); actions = actions.to(out["device"])
-    save_rollout_demo(encoder, out["ac"], videos[0:1], actions[0:1],
+    videos = videos.to(out["device"]); actions = actions.to(out["device"]); states = states.to(out["device"])
+    save_rollout_demo(encoder, out["ac"], videos[0:1], actions[0:1], states[0:1],
                       f"{SAMPLES_DIR}/vjepa2_ac_rollout.png")
     save_input_animation(videos[0:1].cpu(), actions[0].cpu(),
                          f"{SAMPLES_DIR}/vjepa2_input.gif",

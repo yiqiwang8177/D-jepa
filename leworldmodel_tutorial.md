@@ -1,6 +1,6 @@
-# LeWorldModel from Scratch in 233 Lines of PyTorch
+# LeWorldModel from Scratch in 223 Lines of PyTorch
 
-This post implements **LeWorldModel (LeWM)** — the end-to-end JEPA world model — in **about 233 lines of PyTorch**. LeWM's headline contribution is **stable joint training without EMA or stop-grad**: the encoder and predictor are trained together with just two loss terms.
+This post implements **LeWorldModel (LeWM)** — the end-to-end JEPA world model — in **about 223 lines of PyTorch**. LeWM's headline contribution is **stable joint training without EMA or stop-grad**: the encoder and predictor are trained together with just two loss terms.
 
 - Source: [`leworldmodel.py`](./leworldmodel.py)
 - Paper: Maes, Le Lidec, Scieur, LeCun, Balestriero, *LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels* ([arXiv 2603.19312](https://arxiv.org/abs/2603.19312))
@@ -35,24 +35,25 @@ For each clip:
 
 ## The encoder
 
-A small per-frame ViT. Each frame is patched, encoded with a 4-layer transformer, then **mean-pooled** to a single 128-dim token per frame:
+A small per-frame ViT. Each frame is patched, encoded with a 4-layer transformer, then **mean-pooled** to a single 128-dim token per frame and passed through a small BatchNorm projection head. The paper uses a CLS token plus projector; the projector is kept here because it is important for the SIGReg space.
 
 ```python
 class TinyViT(nn.Module):                                    # f_theta (per-frame encoder)
     def __init__(self, img_size=64, patch_size=8, in_chans=1, dim=128, depth=4, heads=4):
         super().__init__()
-        self.s_grid = img_size // patch_size
+        self.s_grid = img_size // patch_size; self.dim = dim
         self.proj = nn.Conv2d(in_chans, dim, kernel_size=patch_size, stride=patch_size)
         self.register_buffer("pos", sincos_2d(self.s_grid, self.s_grid, dim))
         self.blocks = nn.ModuleList([_Block(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.projector = Projector(dim)                  # Linear + BatchNorm1d before SIGReg
 
     def forward(self, frames):                               # (B, T, 1, H, W) -> (B, T, dim)
         B, T = frames.size(0), frames.size(1)
         x = self.proj(frames.reshape(B * T, *frames.shape[2:])).flatten(2).transpose(1, 2)
         x = x + self.pos[None]
         for blk in self.blocks: x = blk(x)
-        return self.norm(x).mean(1).view(B, T, self.dim)     # mean-pool patches -> per-frame embedding
+        return self.projector(self.norm(x).mean(1).view(B, T, self.dim))
 ```
 
 Note this is the *online* encoder — there's no EMA copy, no target encoder, nothing slow-moving. The gradients from the loss flow directly back through it.
@@ -90,16 +91,18 @@ class ARPredictor(nn.Module):                                # f_psi (causal AR 
         self.register_buffer("time_pe", sincos_1d(num_frames, dim))
         self.blocks = nn.ModuleList([CondBlock(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.projector = Projector(dim)                  # predictor-side projection head
 
     def forward(self, z, a):                                 # z: (B, T, D); a: (B, T, action_dim)
         x = z + self.time_pe[None, :z.size(1)]               # add temporal positions
         c = self.act_proj(a)                                 # action embedding for AdaLN
         for blk in self.blocks: x = blk(x, c)                # causal self-attention + AdaLN-zero on c
-        return self.norm(x)
+        return self.projector(self.norm(x))
 ```
 
-Two things to notice:
+Three things to notice:
 
+- **Projection heads before the loss.** LeWM's paper uses projector heads around the encoder/predictor embeddings; this tiny implementation keeps a Linear+BatchNorm projector even though it mean-pools patches instead of using a CLS token.
 - **AdaLN-zero init** (`weight=0, bias=0` on the final modulation layer) means at initialization the predictor *ignores the action*. The model has to learn to use it. This is what V-JEPA 2-AC's residual action projection accomplishes more crudely; LeWM borrows the cleaner DiT recipe.
 - **Causal attention** (`is_causal=True` in scaled dot-product attention). Position $t$ attends to positions $\le t$ only — same constraint as a language-model decoder. This means a single forward pass on a length-$T$ sequence yields next-step predictions for every position, used for teacher-forced training.
 
@@ -110,7 +113,7 @@ This is the load-bearing piece. SIGReg directly measures how non-Gaussian the em
 1. Sample 1024 random unit vectors $A_p \in \mathbb{R}^D$.
 2. Project the batch's embeddings onto each $A_p$ to get scalars $u_p = \langle z, A_p \rangle$.
 3. For each projection $p$ and each quadrature knot $t_k \in [0, 3]$, compute the empirical characteristic function $\hat\varphi_p(t_k) = \mathbb{E}_{\text{batch}}[\cos(t_k u_p) + i \sin(t_k u_p)]$.
-4. Compare to $\mathcal{N}(0, 1)$'s characteristic function $\varphi(t) = e^{-t^2 / 2}$ and integrate the squared difference (trapezoid weights, pre-baked).
+4. Compare to $\mathcal{N}(0, 1)$'s characteristic function $\varphi(t) = e^{-t^2 / 2}$ and integrate the squared difference (Gaussian-windowed trapezoid weights, pre-baked).
 
 If $z$ is genuinely isotropic Gaussian, every $u_p$ is $\mathcal{N}(0, 1)$ and the statistic is ~0. Any departure — collapse, anisotropy, heavy tails — shows up as a non-zero statistic.
 
@@ -121,7 +124,7 @@ class SIGReg(nn.Module):                                     # L_sigreg = E_p Ep
         self.num_proj = num_proj
         t = torch.linspace(0, 3, knots, dtype=torch.float32)
         dt = 3 / (knots - 1)
-        w = torch.full((knots,), 2 * dt); w[[0, -1]] = dt    # trapezoid weights
+        w = torch.full((knots,), 2 * dt); w[[0, -1]] = dt    # Gaussian-windowed trapezoid weights
         phi = torch.exp(-t.square() / 2.0)                   # N(0,1) char fn at knots
         self.register_buffer("t", t)
         self.register_buffer("phi", phi)
@@ -217,8 +220,8 @@ What we don't reproduce here: the **control / planning** layer. The original LeW
 
 ## Hyperparameters
 
-- **Encoder**: TinyViT, 4 layers, 4 heads, dim 128, patch 8 on 64×64 frames. Per-frame embedding via mean-pool.
-- **Predictor**: ARPredictor, 4 layers, 4 heads, dim 128. Causal attention, AdaLN-zero action conditioning, 2D action MLP.
+- **Encoder**: TinyViT, 4 layers, 4 heads, dim 128, patch 8 on 64×64 frames. Per-frame embedding via mean-pool plus Linear+BatchNorm projector.
+- **Predictor**: ARPredictor, 4 layers, 4 heads, dim 128. Causal attention, AdaLN-zero action conditioning, 2D action MLP, Linear+BatchNorm projector.
 - **SIGReg**: 17 quadrature knots in $[0, 3]$, 1024 random unit projections per step, no learnable parameters.
 - **Loss weighting**: $\lambda = 1.0$.
 - **Optimizer**: AdamW, lr `3e-4`, weight decay `0.05` (2D+ params only).

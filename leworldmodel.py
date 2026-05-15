@@ -1,18 +1,4 @@
-"""LeWorldModel (LeWM) on synthetic moving-digit videos. Viz in leworldmodel_extras.py.
-
-End-to-end JEPA world model. No EMA, no stop-grad, no masking. Two losses only:
-
-    L = (pred - tgt).pow(2).mean()    +    lambda * SIGReg(emb)
-
-The predictor is trained to forecast the next-frame embedding from the current
-embedding + per-step action. SIGReg (Sketch Isotropic Gaussian Regularizer)
-pushes the marginal of every random 1D projection of the embedding toward
-N(0, 1) -- this is what prevents representation collapse without an EMA or
-stop-grad.
-
-Paper: Maes et al., LeWorldModel (arXiv 2603.19312).
-Reference: https://github.com/lucas-maes/le-wm
-"""
+"""Minimal LeWorldModel: end-to-end next-embedding MSE + SIGReg, no EMA/stop-grad."""
 import math, random
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -46,13 +32,7 @@ def sincos_2d(h, w, dim):
 
 
 class SIGReg(nn.Module):
-    """Sketch Isotropic Gaussian Regularizer (single-GPU, Epps-Pulley statistic).
-
-    For random unit projections A_p in R^D, sketch the empirical characteristic
-    function E[exp(i t <z, A_p>)] at quadrature knots t in [0, 3] and penalize
-    the squared deviation from N(0,1)'s phi(t) = exp(-t^2/2). Trapezoid weights
-    are pre-baked into self.weights (already multiplied by phi).
-    """
+    """Single-GPU SIGReg / Epps-Pulley statistic with Gaussian-windowed quadrature."""
 
     def __init__(self, knots=17, num_proj=1024):
         super().__init__()
@@ -63,7 +43,7 @@ class SIGReg(nn.Module):
         phi = torch.exp(-t.square() / 2.0)                                       # N(0,1) char fn at knots
         self.register_buffer("t", t)
         self.register_buffer("phi", phi)
-        self.register_buffer("weights", w * phi)                                 # collapsed quadrature*phi
+        self.register_buffer("weights", w * phi)
 
     def forward(self, proj):                                                     # proj: (T, B, D)
         A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)        # fresh projections per step ("sketch")
@@ -74,8 +54,6 @@ class SIGReg(nn.Module):
 
 
 class _Block(nn.Module):
-    """Standard (non-causal) ViT block for the per-frame image encoder."""
-
     def __init__(self, dim, heads, mlp=4.0):
         super().__init__()
         self.n1, self.n2 = nn.LayerNorm(dim, eps=1e-6), nn.LayerNorm(dim, eps=1e-6)
@@ -87,9 +65,24 @@ class _Block(nn.Module):
         return x + self.mlp(self.n2(x))
 
 
-class CondBlock(nn.Module):
-    """Causal transformer block with AdaLN-zero conditioning on the action."""
+class Projector(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+        self.bn = nn.BatchNorm1d(dim)
 
+    def forward(self, x):
+        shape = x.shape
+        y = self.linear(x.reshape(-1, shape[-1]))
+        if self.training and y.size(0) == 1:
+            y = F.batch_norm(y, self.bn.running_mean, self.bn.running_var,
+                             self.bn.weight, self.bn.bias, training=False)
+        else:
+            y = self.bn(y)
+        return y.view(shape)
+
+
+class CondBlock(nn.Module):
     def __init__(self, dim, heads, mlp=4.0):
         super().__init__()
         self.heads = heads; self.dh = dim // heads
@@ -116,8 +109,6 @@ class CondBlock(nn.Module):
 
 
 class TinyViT(nn.Module):
-    """Per-frame ViT: (B, T, C, H, W) -> (B, T, dim) via mean-pool of patches."""
-
     def __init__(self, img_size=64, patch_size=8, in_chans=1, dim=128, depth=4, heads=4):
         super().__init__()
         self.s_grid = img_size // patch_size; self.dim = dim
@@ -125,30 +116,30 @@ class TinyViT(nn.Module):
         self.register_buffer("pos", sincos_2d(self.s_grid, self.s_grid, dim))
         self.blocks = nn.ModuleList([_Block(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.projector = Projector(dim)
 
     def forward(self, frames):
         B, T = frames.size(0), frames.size(1)
         x = self.proj(frames.reshape(B * T, *frames.shape[2:])).flatten(2).transpose(1, 2)
         x = x + self.pos[None]
         for blk in self.blocks: x = blk(x)
-        return self.norm(x).mean(1).view(B, T, self.dim)              # mean-pool patches -> per-frame token
+        return self.projector(self.norm(x).mean(1).view(B, T, self.dim))
 
 
 class ARPredictor(nn.Module):
-    """Causal AR predictor: (z[:t], a[:t]) -> predicted z[1:t+1]. Action conditions via AdaLN-zero."""
-
     def __init__(self, num_frames, dim=128, depth=4, heads=4, action_dim=2):
         super().__init__()
         self.act_proj = nn.Sequential(nn.Linear(action_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.register_buffer("time_pe", sincos_1d(num_frames, dim))
         self.blocks = nn.ModuleList([CondBlock(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.projector = Projector(dim)
 
     def forward(self, z, a):                                          # z: (B, T, D); a: (B, T, action_dim)
         x = z + self.time_pe[None, :z.size(1)]
         c = self.act_proj(a)
         for blk in self.blocks: x = blk(x, c)
-        return self.norm(x)
+        return self.projector(self.norm(x))
 
     @torch.no_grad()
     def rollout(self, z0, actions):                                   # z0: (B, D); actions: (B, K, action_dim)
@@ -160,7 +151,6 @@ class ARPredictor(nn.Module):
 
 
 class ActionedMovingDigit(Dataset):
-    """One MNIST digit on 64x64, per-frame velocity action, wall bounces."""
     V_MAX = 5.0
 
     def __init__(self, root="./data", n_samples=8000, n_frames=10,

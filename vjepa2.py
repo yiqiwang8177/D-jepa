@@ -1,9 +1,4 @@
-"""V-JEPA 2 + V-JEPA 2-AC on synthetic moving-digit videos. Viz in vjepa2_extras.py.
-
-Two phases. Phase 1: V-JEPA pretraining (EMA target, two mask groups, L1).
-Phase 2: V-JEPA 2-AC -- freeze encoder, train AC predictor with teacher
-forcing + rollout. Per-tubelet velocity is the action.
-"""
+"""Minimal V-JEPA2: V-JEPA pretrain + frozen block-causal action/state AC predictor."""
 import copy, math, random
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -89,8 +84,10 @@ class ActionedMovingDigits(Dataset):
                           align_corners=False)[0, 0]
         p = self.starts[i].clone(); mp = self.img_size - self.digit_size
         frames = torch.zeros(self.n_frames, self.img_size, self.img_size)
+        states = torch.zeros(self.t_latent, 2)
         for tl in range(self.t_latent):
             v = self.actions[i, tl] * self.V_MAX
+            states[tl] = p / mp
             for sub in range(self.t_patch):
                 t = tl * self.t_patch + sub
                 xi = max(0, min(mp, int(round(p[0].item()))))
@@ -101,7 +98,7 @@ class ActionedMovingDigits(Dataset):
                 if np_[0] < 0 or np_[0] > mp: v[0] = -v[0]; np_[0] = p[0] + v[0]
                 if np_[1] < 0 or np_[1] > mp: v[1] = -v[1]; np_[1] = p[1] + v[1]
                 p = np_
-        return frames.unsqueeze(0) - 0.5, self.actions[i]
+        return frames.unsqueeze(0) - 0.5, self.actions[i], states
 
 
 class VideoEncoder(nn.Module):
@@ -146,28 +143,54 @@ class JEPAPredictor(nn.Module):
         return self.out_proj(self.norm(x[:, -T:]))
 
 
-class ACPredictor(nn.Module):
-    """z_{t+1} ~= step(z_t, a_t). rollout(z0, actions) chains step()."""
+class CausalBlock(nn.Module):
+    def __init__(self, dim, heads, mlp=4.0):
+        super().__init__()
+        self.n1, self.n2 = nn.LayerNorm(dim, eps=1e-6), nn.LayerNorm(dim, eps=1e-6)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(dim, int(dim * mlp)), nn.GELU(), nn.Linear(int(dim * mlp), dim))
 
-    def __init__(self, s_grid, enc_dim=128, dim=128, depth=4, heads=4, action_dim=2):
+    def forward(self, x, attn_mask):
+        h = self.n1(x); x = x + self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
+        return x + self.mlp(self.n2(x))
+
+
+class ACPredictor(nn.Module):
+    """Block-causal action/state-conditioned predictor for next latent frame."""
+
+    def __init__(self, s_grid, enc_dim=128, dim=128, depth=4, heads=4, action_dim=2, state_dim=2):
         super().__init__()
         self.in_proj = nn.Linear(enc_dim, dim); self.out_proj = nn.Linear(dim, enc_dim)
         self.action_proj = nn.Sequential(nn.Linear(action_dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.state_proj = nn.Sequential(nn.Linear(state_dim, dim), nn.GELU(), nn.Linear(dim, dim))
         self.register_buffer("pos", sincos_2d(s_grid, s_grid, dim))
-        self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
+        self.register_buffer("act_token", torch.zeros(1, 1, dim))
+        self.register_buffer("state_token", torch.zeros(1, 1, dim))
+        self.blocks = nn.ModuleList([CausalBlock(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
 
-    def step(self, z, a):
-        x = self.in_proj(z) + self.pos.unsqueeze(0) + self.action_proj(a).unsqueeze(1)
-        for blk in self.blocks: x = blk(x)
-        return self.out_proj(self.norm(x))
+    @staticmethod
+    def _block_causal_mask(T, width, device):
+        t = torch.arange(T, device=device).repeat_interleave(width)
+        return t[:, None] < t[None, :]  # True entries are masked by MultiheadAttention.
 
-    def rollout(self, z0, actions):
-        z = z0; out = []
-        for k in range(actions.size(1)): z = self.step(z, actions[:, k]); out.append(z)
+    def forward(self, z, actions, states):
+        B, T, S, _ = z.shape
+        a = self.action_proj(actions).unsqueeze(2) + self.act_token
+        st = self.state_proj(states).unsqueeze(2) + self.state_token
+        x = self.in_proj(z) + self.pos[None, None]
+        x = torch.cat([a, st, x], dim=2).reshape(B, T * (S + 2), -1)
+        mask = self._block_causal_mask(T, S + 2, z.device)
+        for blk in self.blocks: x = blk(x, mask)
+        x = self.norm(x).view(B, T, S + 2, -1)[:, :, 2:]
+        return self.out_proj(x)
+
+    def rollout(self, z0, actions, states):
+        z_seq = z0[:, None]; out = []
+        for k in range(actions.size(1)):
+            pred = self.forward(z_seq, actions[:, :k + 1], states[:, :k + 1])[:, -1]
+            z_seq = torch.cat([z_seq, pred[:, None]], dim=1); out.append(pred)
         return torch.stack(out, dim=1)
-
-    forward = step
 
 
 def _bsize(g, s, ar=1.0):
@@ -175,29 +198,41 @@ def _bsize(g, s, ar=1.0):
     return (max(1, min(g, round(math.sqrt(a * ar)))), max(1, min(g, round(math.sqrt(a / ar)))))
 
 
+def _expand_tubes(spatial_cells, t_grid, s_grid):
+    return sorted(t * s_grid * s_grid + p for t in range(t_grid) for p in spatial_cells)
+
+
+def _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells):
+    all_spatial = set(range(s_grid * s_grid))
+    best = None
+    for _ in range(50):
+        masked = set()
+        for _ in range(n_blocks):
+            top, left = rng.randint(0, s_grid - h), rng.randint(0, s_grid - w)
+            masked.update(r * s_grid + c for r in range(top, top + h) for c in range(left, left + w))
+        visible = all_spatial - masked
+        if best is None or len(visible) > len(best[1]):
+            best = (masked, visible)
+        if len(visible) >= min_visible_cells:
+            return masked, visible
+    return best
+
+
 def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5)):
-    rng = rng or random; sg2 = s_grid * s_grid; all_idx = set(range(t_grid * sg2))
+    rng = rng or random
+    min_visible_cells = max(1, math.ceil(min_ctx / t_grid))
     groups = []
     for label, n_blocks, scale in MASK_GROUPS:
-        es = min(scale, 0.5) if s_grid < 8 and scale > 0.5 else scale
-        h, w = _bsize(s_grid, es, rng.uniform(*ar_range))
-        cs, ps = [], []
+        h, w = _bsize(s_grid, scale, rng.uniform(*ar_range))
+        ctx_spatial, pred_spatial = [], []
         for _ in range(B):
-            tubes = set()
-            for _ in range(n_blocks):
-                top, left = rng.randint(0, s_grid - h), rng.randint(0, s_grid - w)
-                for t in range(t_grid):
-                    for r in range(top, top + h):
-                        for c in range(left, left + w):
-                            tubes.add(t * sg2 + r * s_grid + c)
-            ctx = all_idx - tubes
-            if len(ctx) < min_ctx:
-                for p in sorted(tubes)[:min_ctx - len(ctx)]: tubes.discard(p); ctx.add(p)
-            cs.append(sorted(ctx)); ps.append(sorted(tubes))
-        Lc, Lp = min(len(c) for c in cs), min(len(p) for p in ps)
+            masked, visible = _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells)
+            ctx_spatial.append(sorted(visible)); pred_spatial.append(sorted(masked))
+        Lc, Lp = min(len(c) for c in ctx_spatial), min(len(p) for p in pred_spatial)
+        ctx = [_expand_tubes(sorted(rng.sample(c, Lc)), t_grid, s_grid) for c in ctx_spatial]
+        pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
         groups.append({"label": label, "n_blocks": n_blocks, "block_hw": (h, w),
-                       "ctx": [sorted(rng.sample(c, Lc)) for c in cs],
-                       "pred": [sorted(rng.sample(p, Lp)) for p in ps]})
+                       "ctx": ctx, "pred": pred})
     return groups
 
 
@@ -211,7 +246,7 @@ def pretrain(loader, epochs, device, lr=3e-4, wd=0.05, ema_start=0.998, ema_end=
     total = epochs * len(loader); rng = random.Random(0)
     losses = {g[0]: [] for g in MASK_GROUPS}; step = 0; D = ctx_enc.dim
     for epoch in range(epochs):
-        for videos, _ in loader:
+        for videos, _, _ in loader:
             videos = videos.to(device); B = videos.size(0)
             groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng)
             with torch.no_grad(): full = F.layer_norm(tgt_enc(videos), (D,))
@@ -232,7 +267,7 @@ def pretrain(loader, epochs, device, lr=3e-4, wd=0.05, ema_start=0.998, ema_end=
     return tgt_enc, losses
 
 
-def train_ac(encoder, loader, epochs, device, lr=3e-4, wd=0.05, rollout_k=4, rollout_w=0.5):
+def train_ac(encoder, loader, epochs, device, lr=3e-4, wd=0.05, rollout_k=2, rollout_w=1.0):
     print("=== Phase 2: V-JEPA 2-AC ===")
     encoder.eval()
     for p in encoder.parameters(): p.requires_grad_(False)
@@ -241,19 +276,20 @@ def train_ac(encoder, loader, epochs, device, lr=3e-4, wd=0.05, rollout_k=4, rol
     T, S = encoder.t_grid, encoder.s_grid ** 2
     losses = {"tf": [], "roll": [], "a=0": []}; step = 0
     for epoch in range(epochs):
-        for videos, actions in loader:
-            videos = videos.to(device); actions = actions.to(device); B = videos.size(0)
+        for videos, actions, states in loader:
+            videos = videos.to(device); actions = actions.to(device); states = states.to(device); B = videos.size(0)
             with torch.no_grad(): z = encoder(videos).view(B, T, S, -1)
-            preds = torch.stack([ac.step(z[:, t], actions[:, t + 1]) for t in range(T - 1)], 1)
+            trans_actions = actions[:, 1:]  # action for the next tubelet transition in this toy generator
+            trans_states = states[:, :-1]   # current state/proprio token; do not leak target state
+            preds = ac(z[:, :-1], trans_actions, trans_states)
             tgt = z[:, 1:]; loss_tf = (preds - tgt).abs().mean()
             k = min(rollout_k, T - 1)
-            rolled = ac.rollout(z[:, 0], actions[:, 1:k + 1])
-            loss_roll = (rolled - z[:, 1:k + 1]).abs().mean()
+            rolled = ac.rollout(z[:, 0], actions[:, 1:k + 1], states[:, :k])
+            loss_roll = (rolled[:, -1] - z[:, k]).abs().mean()
             loss = loss_tf + rollout_w * loss_roll
             opt.zero_grad(); loss.backward(); opt.step()
             with torch.no_grad():
-                pz = torch.stack([ac.step(z[:, t], torch.zeros_like(actions[:, t + 1]))
-                                  for t in range(T - 1)], 1)
+                pz = ac(z[:, :-1], torch.zeros_like(trans_actions), trans_states)
                 loss_a = (pz - tgt).abs().mean().item()
             losses["tf"].append(loss_tf.item()); losses["roll"].append(loss_roll.item())
             losses["a=0"].append(loss_a)

@@ -1,11 +1,4 @@
-"""C-JEPA on 3-digit bouncing video. Viz in cjepa_extras.py.
-
-Faithful: frozen object-centric "encoder" (we use a frozen per-cell embedding
-stand-in for VideoSAUR); object-level trajectory masking with identity anchor
-at t=0 + all-future masked; mask token = learned + TimePE[t] + id_proj(z[0,k]);
-no slot pos embed; bidirectional transformer over flattened (T*K, D);
-L2 = L_history + L_future on detached targets; no EMA.
-"""
+"""Minimal C-JEPA: oracle slots, identity anchor, object-history + future masking, no EMA."""
 import math, random
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -46,8 +39,6 @@ def pick_device():
 
 
 class BouncingTriple(Dataset):
-    """3 MNIST digits in a 4x4 grid bouncing with pairwise elastic collisions."""
-
     def __init__(self, root="./data", n_samples=8000, seed=0):
         mnist = MNIST(root=root, train=True, download=True)
         imgs = mnist.data.float() / 255.
@@ -99,8 +90,6 @@ class BouncingTriple(Dataset):
 
 
 class FrozenSlotEncoder(nn.Module):
-    """Frozen random per-cell embedding -- stand-in for VideoSAUR."""
-
     def __init__(self, dim=SLOT_DIM, n_cells=GRID * GRID):
         super().__init__()
         self.dim = dim; self.embed = nn.Embedding(n_cells, dim)
@@ -112,8 +101,6 @@ class FrozenSlotEncoder(nn.Module):
 
 
 class MaskedSlotPredictor(nn.Module):
-    """C-JEPA predictor: bidirectional transformer over (T*K, D) with anchor-projected mask tokens."""
-
     def __init__(self, dim=SLOT_DIM, depth=4, heads=4):
         super().__init__()
         self.dim = dim
@@ -122,6 +109,7 @@ class MaskedSlotPredictor(nn.Module):
         self.register_buffer("time_pe", sincos_1d(T, dim))
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.to_out = nn.Linear(dim, dim)
 
     def forward(self, slots, mask_indices, ablate_to_anchor_only=False):
         B = slots.size(0)
@@ -133,7 +121,7 @@ class MaskedSlotPredictor(nn.Module):
         if ablate_to_anchor_only: is_q[1:T_HIST, :] = True
         x = torch.where(is_q[None, :, :, None], query, real).reshape(B, T * K, self.dim)
         for blk in self.blocks: x = blk(x)
-        return self.norm(x).view(B, T, K, self.dim)
+        return self.to_out(self.norm(x)).view(B, T, K, self.dim)
 
 
 def sample_mask_indices(rng, max_mask=2):

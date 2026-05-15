@@ -1,10 +1,4 @@
-"""I-JEPA on CIFAR-10. Viz/probe in ijepa_extras.py.
-
-Faithful: encoder owns patch embed; full EMA copy as target; 4 target blocks
-(scale 0.15-0.20, AR 0.75-1.5) + 1 context block (scale 0.85-1.0) with
-overlap removed and trim-to-min by random subsample; smooth_l1 on LN'd
-targets; EMA 0.996->1.0; warmup+cosine LR; WD split.
-"""
+"""Minimal I-JEPA: EMA target, 4 target blocks, context block, smooth-L1 on LN targets."""
 import copy, math, random
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -168,5 +162,4 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
             "losses": losses, "loader": loader, "device": device}
 
 
-if __name__ == "__main__":
-    train()
+if __name__ == "__main__": train()

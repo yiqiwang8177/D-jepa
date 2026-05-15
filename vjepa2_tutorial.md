@@ -1,6 +1,6 @@
-# V-JEPA 2 from Scratch in 278 Lines of PyTorch
+# V-JEPA 2 from Scratch in 314 Lines of PyTorch
 
-This post extends [the V-JEPA tutorial](./vjepa_tutorial.md) to V-JEPA 2's headline contribution: **V-JEPA 2-AC**, an action-conditioned predictor that turns a pretrained video encoder into a latent-space world model. We'll implement the two-phase recipe in **about 278 lines of PyTorch**.
+This post extends [the V-JEPA tutorial](./vjepa_tutorial.md) to V-JEPA 2's headline contribution: **V-JEPA 2-AC**, an action-conditioned predictor that turns a pretrained video encoder into a latent-space world model. We'll implement the two-phase recipe in **about 314 lines of PyTorch**.
 
 - Source: [`vjepa2.py`](./vjepa2.py)
 - Paper: Assran et al., *V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning* ([arXiv 2506.09985](https://arxiv.org/abs/2506.09985))
@@ -10,13 +10,13 @@ This post extends [the V-JEPA tutorial](./vjepa_tutorial.md) to V-JEPA 2's headl
 V-JEPA gives you a video encoder. **V-JEPA 2** scales that recipe to internet-sized data and adds a second post-training phase:
 
 1. **Phase 1** — V-JEPA pretraining. Same algorithm as V-JEPA: tubelet encoder, two mask groups, EMA target, L1 loss. Produces an action-free video encoder $f_{\bar\theta}$.
-2. **Phase 2** — V-JEPA 2-AC. The encoder is **frozen**. A new predictor is trained on small action-trajectory data to model future latent states conditioned on actions: $z_{t+1} \approx f_\psi(z_t, a_t)$.
+2. **Phase 2** — V-JEPA 2-AC. The encoder is **frozen**. A new predictor is trained on small action-trajectory data to model future latent states conditioned on transition actions and state/proprio tokens: $z_{t+1} \approx f_\psi(z_{\le t}, a_{1:t+1}, s_{\le t})$.
 
 The first phase is just V-JEPA — already covered in [`vjepa_tutorial.md`](./vjepa_tutorial.md). This post focuses on **phase 2**: the action-conditioned predictor, the teacher-forcing + rollout losses, and what falls out when you ablate the action.
 
 ## The setting
 
-We need a video dataset with known actions. Real V-JEPA 2-AC uses robot trajectories. We use a synthetic stand-in: **moving-digit videos with controllable velocity**.
+We need a video dataset with known actions and states. Real V-JEPA 2-AC uses robot trajectories with end-effector state/proprioception. We use a synthetic stand-in: **moving-digit videos with controllable velocity** plus normalized digit position as the state token.
 
 ![Synthetic clip with per-tubelet action overlaid](./samples/vjepa2_input.gif)
 
@@ -29,7 +29,7 @@ For each clip:
 - the encoder produces a 5-tubelet latent sequence $(z_0, \dots, z_4)$
 - the **action** for tubelet $t$ is the velocity used during that tubelet
 
-This is the simplest setup where the action is genuinely informative: $z_{t+1}$ depends on the action chosen during tubelet $t+1$. Real V-JEPA 2-AC swaps "per-tubelet velocity" for "robot end-effector velocity + proprioception"; the predictor shape is the same.
+This is the simplest setup where the action is genuinely informative: $z_{t+1}$ depends on the transition action for tubelet $t+1$ and the current state token $s_t$. Real V-JEPA 2-AC swaps "per-tubelet velocity + position" for richer robot action/proprioception; the predictor shape is the same.
 
 ## The phases
 
@@ -53,29 +53,31 @@ The only thing phase 1 hands to phase 2 is `tgt_enc` — the EMA-stabilized enco
 
 ### Phase 2: V-JEPA 2-AC
 
-The encoder is now frozen. We instantiate a fresh action-conditioned predictor and train it on `(video, actions)` pairs:
+The encoder is now frozen. We instantiate a fresh action/state-conditioned predictor and train it on `(video, actions, states)` triples:
 
 ```python
 def train_ac(encoder, loader, epochs, device, lr=3e-4, wd=0.05,
-             rollout_k=4, rollout_w=0.5):
+             rollout_k=2, rollout_w=1.0):
     encoder.eval()
     for p in encoder.parameters(): p.requires_grad_(False)  # encoder is FROZEN in phase 2
     ac = ACPredictor(s_grid=encoder.s_grid).to(device)
     opt = torch.optim.AdamW(param_groups([ac], wd), lr=lr)
     T, S = encoder.t_grid, encoder.s_grid ** 2
     for epoch in range(epochs):
-        for videos, actions in loader:
-            videos = videos.to(device); actions = actions.to(device); B = videos.size(0)
+        for videos, actions, states in loader:
+            videos = videos.to(device); actions = actions.to(device); states = states.to(device)
+            B = videos.size(0)
             with torch.no_grad():
                 z = encoder(videos).view(B, T, S, -1)    # frozen encoder -> latent trajectory
-            preds = torch.stack([ac.step(z[:, t], actions[:, t + 1])
-                                 for t in range(T - 1)], 1)         # teacher forcing
+            trans_actions = actions[:, 1:]                         # toy transition actions
+            trans_states = states[:, :-1]                           # current toy proprio/state tokens
+            preds = ac(z[:, :-1], trans_actions, trans_states)      # block-causal teacher forcing
             tgt = z[:, 1:]
             loss_tf = (preds - tgt).abs().mean()                    # L1 over all transitions
             k = min(rollout_k, T - 1)
-            rolled = ac.rollout(z[:, 0], actions[:, 1:k + 1])       # k-step latent rollout
-            loss_roll = (rolled - z[:, 1:k + 1]).abs().mean()
-            loss = loss_tf + rollout_w * loss_roll                  # combined objective
+            rolled = ac.rollout(z[:, 0], actions[:, 1:k + 1], states[:, :k])        # k-step rollout
+            loss_roll = (rolled[:, -1] - z[:, k]).abs().mean()      # paper-style final rollout target
+            loss = loss_tf + rollout_w * loss_roll                  # equal-weight combined objective
             opt.zero_grad(); loss.backward(); opt.step()
 ```
 
@@ -83,31 +85,31 @@ Two new ideas appear here.
 
 ## The action-conditioned predictor
 
-A single-step latent transition function: take the latent at time $t$, take the action at time $t+1$, predict the latent at time $t+1$.
+A tiny block-causal sequence model: at each time step it sees one action token, one state/proprio token, plus the spatial latent feature tokens, and predicts the next latent feature map. This keeps the causal-token structure of V-JEPA2-AC while staying small enough for an educational script.
 
 ```python
-class ACPredictor(nn.Module):                            # f_psi (action-conditioned predictor)
-    def __init__(self, s_grid, enc_dim=128, dim=128, depth=4, heads=4, action_dim=2):
-        super().__init__()
-        self.in_proj = nn.Linear(enc_dim, dim)
-        self.out_proj = nn.Linear(dim, enc_dim)
-        self.action_proj = nn.Sequential(                # 2D action -> dim-dim action embedding
-            nn.Linear(action_dim, dim), nn.GELU(), nn.Linear(dim, dim))
-        self.register_buffer("pos", sincos_2d(s_grid, s_grid, dim))  # 2D spatial pos (single timestep)
-        self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
+class ACPredictor(nn.Module):                            # small block-causal V-JEPA2-AC predictor
+    def forward(self, z, actions, states):               # z: (B, T, S, D); actions/states: (B, T, 2)
+        # Per time step: [action token, state token, spatial feature tokens...]
+        # Attention is block-causal: current-time tokens can attend within their timestep
+        # and to earlier timesteps, but never to future feature tokens.
+        B, T, S, _ = z.shape
+        a = self.action_proj(actions).unsqueeze(2) + self.act_token
+        st = self.state_proj(states).unsqueeze(2) + self.state_token
+        x = self.in_proj(z) + self.pos[None, None]
+        x = torch.cat([a, st, x], dim=2).reshape(B, T * (S + 2), -1)
+        mask = self._block_causal_mask(T, S + 2, z.device)
+        for blk in self.blocks: x = blk(x, mask)
+        x = self.norm(x).view(B, T, S + 2, -1)[:, :, 2:]
+        return self.out_proj(x)                          # predicted next-latent feature maps
 
-    def step(self, z, a):                                # z: (B, S, enc_dim), a: (B, action_dim)
-        x = self.in_proj(z) + self.pos.unsqueeze(0) + self.action_proj(a).unsqueeze(1)
-                                                         # add action embedding to every spatial token
-        for blk in self.blocks: x = blk(x)
-        return self.out_proj(self.norm(x))               # predicted z_{t+1}
-
-    def rollout(self, z0, actions):                      # z0: (B, S, D); actions: (B, K, action_dim)
-        z = z0; out = []
+    def rollout(self, z0, actions, states):
+        z_seq = z0[:, None]; out = []
         for k in range(actions.size(1)):
-            z = self.step(z, actions[:, k]); out.append(z)
-        return torch.stack(out, dim=1)                   # (B, K, S, D) -- autoregressive trajectory
+            pred = self.forward(z_seq, actions[:, :k + 1], states[:, :k + 1])[:, -1]
+            z_seq = torch.cat([z_seq, pred[:, None]], dim=1)
+            out.append(pred)
+        return torch.stack(out, dim=1)
 ```
 
 Note what's *not* here:
@@ -122,18 +124,15 @@ V-JEPA 2-AC trains the predictor with two complementary losses.
 
 **Teacher forcing.** For every $t$, predict $z_{t+1}$ from the *true* $z_t$ and action $a_{t+1}$. This gives the predictor maximally clean training signal at every position.
 
-$$\mathcal{L}_{\text{tf}} = \frac{1}{T-1} \sum_{t=0}^{T-2} \|f_\psi(z_t, a_{t+1}) - z_{t+1}\|_1$$
+$$\mathcal{L}_{\text{tf}} = \frac{1}{T-1} \sum_{t=0}^{T-2} \|f_\psi(z_{\le t}, a_{1:t+1}, s_{\le t})_t - z_{t+1}\|_1$$
 
-**Rollout.** Start from $z_0$ and apply the predictor autoregressively, feeding the *predicted* latent back as input. Compare each rolled latent against the true target.
+**Rollout.** Start from $z_0$ and apply the predictor autoregressively, feeding the *predicted* latent back as input. The minimal script uses a two-step rollout and compares the final rolled latent against the true target, matching the paper's short-rollout training shape.
 
-$$\mathcal{L}_{\text{roll}} = \frac{1}{K} \sum_{k=1}^{K} \|\hat{z}_k - z_k\|_1, \quad \hat{z}_k = f_\psi(\hat{z}_{k-1}, a_k), \quad \hat{z}_0 = z_0$$
+$$\mathcal{L}_{\text{roll}} = \|\hat{z}_K - z_K\|_1, \quad \hat{z}_{1:K} = \text{rollout}_\psi(z_0, a_{1:K}, s_{0:K-1})$$
 
 The combined loss is $\mathcal{L} = \mathcal{L}_{\text{tf}} + \lambda \mathcal{L}_{\text{roll}}$. Teacher forcing trains the one-step dynamics; rollout penalizes error accumulation across multiple steps.
 
-Two notes where this tutorial deviates from the paper:
-
-- $\lambda = 0.5$ here. The paper's Eq. 4 weights the two terms **equally** ($\lambda = 1$); we down-weight rollout for training stability on the toy.
-- We backprop through **$k=4$** rollout steps. The paper differentiates through only one recurrent step (the rollout-loss target is at $T=2$); deeper differentiation is treated as an inference-time concern. Our $k=4$ is more aggressive than the paper's recipe and is a toy-scale choice.
+The minimal implementation now keeps the paper's important training shape: equal teacher-forcing and rollout weights, with a short two-step rollout. It remains smaller than the paper system: the state token is only normalized digit position rather than robot proprioception/end-effector state, and the predictor is tiny rather than a 300M-parameter transformer.
 
 ## Running it
 
@@ -184,16 +183,14 @@ Five things V-JEPA 2 + V-JEPA 2-AC get right, in roughly the order they matter:
 
 4. **Teacher forcing + rollout.** Teacher forcing gives clean training signal at every step (the predictor sees true `z_t`); rollout penalizes error accumulation when feeding predictions back as input. Together they train the one-step transition function while keeping multi-step rollouts stable.
 
-5. **The AC predictor is `(z, a) → z'`.** A single autoregressive step is the unit. Multi-step prediction is just `step` applied $k$ times. This makes the trained model directly usable for planning: query the predictor with a candidate action sequence, score the predicted latent trajectory, pick the best one.
+5. **The AC predictor is `(z, a) → z'`.** A single autoregressive prediction is the unit. Multi-step prediction is `rollout`: feed each predicted latent back as the next input. This makes the trained model directly usable for planning: query the predictor with a candidate action sequence, score the predicted latent trajectory, pick the best one.
 
 What we don't reproduce here: a pixel decoder. Real V-JEPA 2-AC papers / blog posts decode predicted latents back to RGB for visualization — that decoder is a separate model trained on top of frozen V-JEPA 2 features. Without it, "what did the predictor predict?" lives in latent space and can only be measured by L1 error against the encoder's targets.
 
-## What's next
-
 ## Hyperparameters
 
-- **Phase 1**: 3 epochs, lr `3e-4`, EMA `0.998 → 1.0`, two mask groups (short 8×0.15, long 2×0.7, long auto-capped to 0.5).
-- **Phase 2**: 4 epochs, lr `3e-4`, **no EMA**, rollout horizon `k=4`, rollout weight `0.5`.
+- **Phase 1**: 3 epochs, lr `3e-4`, EMA `0.998 → 1.0`, two mask groups (short 8×0.15, long 2×0.7, long scale 0.7; whole-tube trimming for rectangular batches).
+- **Phase 2**: 4 epochs, lr `3e-4`, **no EMA**, rollout horizon `k=2`, rollout weight `1.0`.
 - **Encoder**: ViT-tiny, Conv3d `(2, 8, 8)` (patch 8 so motion crosses patch boundaries).
 - **AC predictor**: dim 128, depth 4, heads 4.
 - **Action**: 2D velocity, per-tubelet.
