@@ -12,6 +12,8 @@ venv/
 
 # Data & artifacts
 data/
+third_parties/
+scripts/
 
 # OMC scratch
 .omc/
