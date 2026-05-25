@@ -15,6 +15,9 @@ data/
 third_parties/
 scripts/
 
+__pycache__
+wandb/
+
 # OMC scratch
 .omc/
 .claude/
