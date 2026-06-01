@@ -8,8 +8,19 @@ from torch.utils.data import DataLoader, Dataset
 from sklearn.decomposition import PCA
 import torchvision.transforms as T
 
-MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("motion", 1, 0.15)]
-MOTION_range = (0.05, 0.2) # choose top 10 ~30% of patches with movement
+MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
+ctr_gap = 2
+
+def visualize_attnmap(map, size=(96, 96)):
+    # map: (s_grid, s_grid)
+    # size: (H, W)
+    attn_map = (map - map.min()) / (map.max() - map.min() + 1e-8)  # normalize to [0, 1]
+    attn_map = cv2.resize(attn_map, size, interpolation=cv2.INTER_CUBIC)  # upsample to image size
+    attn_map = (attn_map * 255).astype(np.uint8)  # convert to uint8
+    # (H, W) -> (H, W, 3) 
+    attn_map = np.stack([attn_map] * 3, axis=-1)
+
+    return Image.fromarray(attn_map)
 
 def visualize_tokens_pca(tokens, h=16, w=16, normalize=True):
     """
@@ -65,7 +76,6 @@ def sincos_1d(n, dim):
     pe = torch.zeros(n, dim); pe[:, 0::2] = torch.sin(pos * div); pe[:, 1::2] = torch.cos(pos * div)
     return pe
 
-
 def sincos_2d(h, w, dim):
     assert dim % 4 == 0; sub = dim // 4
     yy, xx = [t.reshape(-1).float() for t in torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")]
@@ -81,7 +91,6 @@ def sincos_3d(t, h, w, dim, t_frac=0.25):
     pe[:, :td] = pe_t.unsqueeze(1).expand(t, h * w, td).reshape(-1, td)
     pe[:, td:] = pe_s.unsqueeze(0).expand(t, h * w, sd).reshape(-1, sd)
     return pe
-
 
 class Block(nn.Module):
     def __init__(self, dim, heads, mlp=4.0):
@@ -99,7 +108,6 @@ def param_groups(modules, wd):
     nd = [p for n, p in np_ if p.ndim < 2 or n.endswith("bias")]
     d = [p for n, p in np_ if p.ndim >= 2 and not n.endswith("bias")]
     return [{"params": d, "weight_decay": wd}, {"params": nd, "weight_decay": 0.0}]
-
 
 @torch.no_grad()
 def ema_update(tgt, online, m):
@@ -142,81 +150,16 @@ class RobomimicVideos(Dataset):
     def __len__(self):
         return len(self.indices)
 
-    def compute_flow(self, img1, img2):
-        """
-        img1, img2:
-            PIL images
-
-        return:
-            flow tensor of shape (2, H, W)
-        """
-
-        # PIL -> numpy grayscale
-        img1, img2 = img1.resize((self.img_size, self.img_size)), img2.resize((self.img_size, self.img_size))
-        g1 = np.array(img1.convert("L"))
-        g2 = np.array(img2.convert("L"))
-        patch = self.cfg.patch_size
-        H, W = self.img_size, self.img_size
-
-        flow = cv2.calcOpticalFlowFarneback(
-            g1,
-            g2,
-            None,
-            pyr_scale=0.5,
-            levels=3,
-            winsize=15,
-            iterations=3,
-            poly_n=5,
-            poly_sigma=1.2,
-            flags=0
-        )
-       
-        # OpenCV returns H x W x 2
-        flow_patch = flow.reshape(
-            H // patch,
-            patch,
-            W // patch,
-            patch,
-            2
-        ).mean(axis=(1, 3))
- 
-        return flow_patch
-
-    def _flow_center(self, flows):
-        # sample a random number between motion range[0] and range[1]
-        top_k = self.rng.uniform(*MOTION_range)
-        t, h, w, _ = flows.shape
-        top_k = int( top_k * h * w )
-        mag = np.linalg.norm(flows, axis=-1)
-        
-        centers = []
-        for i in range(t):
-            # sort the magnitudes and get the top_k indices
-            idx = np.argpartition(mag[i].flatten(), -top_k)[-top_k]
-            row, col = divmod(idx, w)
-            centers.append([int(col), int(row)])  # (x, y) format
-        return centers
-
     def __getitem__(self, idx):
         frame_paths = self.indices[idx]
-        first_img, frames, flows = None, [], []
+        frames = []
         for path in frame_paths:
             img = Image.open(path)
-            
             frames.append(self.transform(img)) # range [0, 1]
             
-            if first_img is None:
-                first_img = img
-            else:
-                flows.append(self.compute_flow(first_img, img))
         # Stack → (num_frames, C, H, W)
         video = torch.stack(frames).permute(1, 0, 2, 3) - 0.5
-        flows = np.stack(flows)  # (num_frames-1, H_patch, W_patch, 2)
-        flows_norm = np.linalg.norm(flows, axis=-1)  # (num_frames-1, H_patch, W_patch)
-        return video, flows_norm
-        # centers = self._flow_center(flows)  
-        # centers = np.array( [centers[0]] + centers )  # repeat the first center for the first frame
-        # return video, centers
+        return video
 
 class VideoEncoder(nn.Module):
     def __init__(self, num_frames=10, t_patch=2, img_size=64, patch_size=8,
@@ -242,7 +185,6 @@ class VideoEncoder(nn.Module):
         for blk in self.blocks: x = blk(x)
         return self.norm(x)
 
-
 class JEPAPredictor(nn.Module):
     def __init__(self, t_grid, s_grid, enc_dim=128, dim=64, depth=4, heads=4):
         super().__init__()
@@ -259,7 +201,6 @@ class JEPAPredictor(nn.Module):
         for blk in self.blocks: x = blk(x)
         return self.out_proj(self.norm(x[:, -T:]))
 
-
 class CausalBlock(nn.Module):
     def __init__(self, dim, heads, mlp=4.0):
         super().__init__()
@@ -271,44 +212,19 @@ class CausalBlock(nn.Module):
         h = self.n1(x); x = x + self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
         return x + self.mlp(self.n2(x))
 
-
-class ACPredictor(nn.Module):
-    """Block-causal action/state-conditioned predictor for next latent frame."""
-
-    def __init__(self, s_grid, enc_dim=128, dim=128, depth=4, heads=4, action_dim=2, state_dim=2):
+class AttentionPooling(nn.Module):
+    # convert each token to a weight via MLP, and take the weighted average of the tokens as output.
+    # then, output a softmax distribution
+    def __init__(self, in_dim, hidden_dim = 512, out_dim = 256):
         super().__init__()
-        self.in_proj = nn.Linear(enc_dim, dim); self.out_proj = nn.Linear(dim, enc_dim)
-        self.action_proj = nn.Sequential(nn.Linear(action_dim, dim), nn.GELU(), nn.Linear(dim, dim))
-        self.state_proj = nn.Sequential(nn.Linear(state_dim, dim), nn.GELU(), nn.Linear(dim, dim))
-        self.register_buffer("pos", sincos_2d(s_grid, s_grid, dim))
-        self.register_buffer("act_token", torch.zeros(1, 1, dim))
-        self.register_buffer("state_token", torch.zeros(1, 1, dim))
-        self.blocks = nn.ModuleList([CausalBlock(dim, heads) for _ in range(depth)])
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
-
-    @staticmethod
-    def _block_causal_mask(T, width, device):
-        t = torch.arange(T, device=device).repeat_interleave(width)
-        return t[:, None] < t[None, :]  # True entries are masked by MultiheadAttention.
-
-    def forward(self, z, actions, states):
-        B, T, S, _ = z.shape
-        a = self.action_proj(actions).unsqueeze(2) + self.act_token
-        st = self.state_proj(states).unsqueeze(2) + self.state_token
-        x = self.in_proj(z) + self.pos[None, None]
-        x = torch.cat([a, st, x], dim=2).reshape(B, T * (S + 2), -1)
-        mask = self._block_causal_mask(T, S + 2, z.device)
-        for blk in self.blocks: x = blk(x, mask)
-        x = self.norm(x).view(B, T, S + 2, -1)[:, :, 2:]
-        return self.out_proj(x)
-
-    def rollout(self, z0, actions, states):
-        z_seq = z0[:, None]; out = []
-        for k in range(actions.size(1)):
-            pred = self.forward(z_seq, actions[:, :k + 1], states[:, :k + 1])[:, -1]
-            z_seq = torch.cat([z_seq, pred[:, None]], dim=1); out.append(pred)
-        return torch.stack(out, dim=1)
-
+        self.mlp = nn.Sequential(nn.LayerNorm(in_dim, eps=1e-6), nn.Linear(in_dim, 1) )
+        self.out = nn.Sequential( nn.LayerNorm(in_dim, eps=1e-6), nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim) )
+    def forward(self, tokens):
+        weights = self.mlp(tokens).squeeze(-1)  # (B N D) -> (B, N)
+        weights = F.softmax(weights, dim=-1)  # (B, N)
+        pooled = (tokens * weights.unsqueeze(-1)).sum(dim=1)  # (B, D)
+        logits = self.out(pooled)  # (B, out_dim)
+        return logits, weights
 
 def _bsize(g, s, ar=1.0):
     a = s * g * g
@@ -316,32 +232,6 @@ def _bsize(g, s, ar=1.0):
 
 def _expand_tubes(spatial_cells, t_grid, s_grid):
     return sorted(t * s_grid * s_grid + p for t in range(t_grid) for p in spatial_cells)
-
-def _expand_tubes_center(spatial_cells, t_grid, s_grid, center_B, min_visible_cells=2):
-    cx0, cy0 = center_B[0, 0], center_B[0, 1]
-    result = []
-
-    for t in range(t_grid):
-        cx_t, cy_t = center_B[t, 0], center_B[t, 1]
-        dx = round(cx_t - cx0)
-        dy = round(cy_t - cy0)
-
-        shifted = []
-        for p in spatial_cells:
-            row, col = divmod(p, s_grid)
-            new_row = row + dy
-            new_col = col + dx
-            if 0 <= new_row < s_grid and 0 <= new_col < s_grid:
-                shifted.append(t * s_grid * s_grid + new_row * s_grid + new_col)
-
-        if len(shifted) < min_visible_cells:
-            # fall back to unshifted cells for this frame
-            # shifted = [t * s_grid * s_grid + p for p in spatial_cells]
-            pass
-
-        result.extend(shifted)
-
-    return sorted(result)
 
 def _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells):
     all_spatial = set(range(s_grid * s_grid))
@@ -358,54 +248,14 @@ def _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells):
             return masked, visible
     return best
 
-# def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5), center_Bs=None):
-#     rng = rng or random
-#     min_visible_cells = max(1, math.ceil(min_ctx / t_grid))
-#     groups = []
-#     for label, n_blocks, scale in MASK_GROUPS:
-#         h, w = _bsize(s_grid, scale, rng.uniform(*ar_range))
-#         ctx_spatial, pred_spatial = [], []
-#         for _ in range(B):
-#             masked, visible = _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells)
-#             ctx_spatial.append(sorted(visible)); pred_spatial.append(sorted(masked))
-#         # all items in the batch have identical-length index lists
-#         Lc, Lp = min(len(c) for c in ctx_spatial), min(len(p) for p in pred_spatial)
-#         if label != "motion":
-#             ctx = [_expand_tubes(sorted(rng.sample(c, Lc)), t_grid, s_grid) for c in ctx_spatial]
-#             pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
-#         else:
-#             ctx_min_limit, pred_min_limit = max( Lc//10, min_visible_cells), max( Lp//10, min_visible_cells)
-            
-#             ctx = [_expand_tubes_center(c, t_grid, s_grid, center_B, ctx_min_limit) for c, center_B in zip(ctx_spatial, center_Bs)]
-#             pred = [_expand_tubes_center(p, t_grid, s_grid, center_B, pred_min_limit) for p, center_B in zip(pred_spatial, center_Bs)]
-#             min_ctx = min(len(c) for c in ctx); min_pred = min(len(p) for p in pred)
-#             # sampling leads to unaligned ctx-pred, causing issues
-#             ctx = [ sorted(rng.sample(c, min_ctx)) for c in ctx ]
-#             pred = [ sorted(rng.sample(p, min_pred)) for p in pred ]
-#         groups.append({"label": label, "n_blocks": n_blocks, "block_hw": (h, w),
-#                        "ctx": ctx, "pred": pred})
-#     return groups
-
-def _sample_motion_mask(t,  flow_norm, topk, min_visible_cells=4):
-    h, w = flow_norm.shape
-    num_patches = h * w
-    # convert local frame indices to global indices with time
-    offset = t * num_patches
-    k = max(min_visible_cells, int(topk * num_patches))
-    idx = np.argpartition(flow_norm.flatten(), -k)[-k:] + offset
-    masked = set(idx.tolist())
-    visible = set(range(offset, offset + num_patches)) - masked
-    
-    return list(masked), list(visible)
-
-def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5), flows=None):
+def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5)):
     rng = rng or random
     min_visible_cells = max(1, math.ceil(min_ctx / t_grid))
     groups = []
     for label, n_blocks, scale in MASK_GROUPS:
         h, w = _bsize(s_grid, scale, rng.uniform(*ar_range))
         ctx_spatial, pred_spatial = [], []
-        if label != "motion":
+        if label != "ctr":
             for _ in range(B):
                 masked, visible = _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells)
                 ctx_spatial.append(sorted(visible)); pred_spatial.append(sorted(masked))
@@ -416,15 +266,14 @@ def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1
             pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
         else:
             ctx, pred = [], []
-            topk = rng.uniform(*MOTION_range) # all frames across batch masked out same amount of patches
-            # flows: (B, T-1, H_patch, W_patch)
-            index = np.linspace(0, flows.shape[1]-1, t_grid).round().astype(int)  # select t_grid frames from T-1 frames
-            for flow in flows: # looping across sample in batch
-                masked_sample, visible_sample = [], []
-                for j, i in enumerate(index): # looping across frame in sample (match t_grid frames)
-                    masked, visible = _sample_motion_mask(j, flow[i], topk)  
-                    masked_sample.extend(masked); visible_sample.extend(visible)
-                ctx.append(sorted(masked_sample)); pred.append(sorted(visible_sample))
+            # randomly masked out all patches at frame i, and set patches not from frame i to be visible context.
+            # all patches from frame j = (i + ctr_gap) % t_grid to be prediction target. Learn arbitrary neighbor frames to be have similar background.
+            for _ in range(B):
+                i = rng.randint(0, t_grid - 1); j = (i + ctr_gap) % t_grid
+                visible = [p for p in range(t_grid * s_grid * s_grid) if not (i * s_grid * s_grid <= p < (i + 1) * s_grid * s_grid)]
+                ctx.append(visible)
+                masked = list(range(j * s_grid * s_grid, (j + 1) * s_grid * s_grid))
+                pred.append(masked)
             
         groups.append({"label": label, "n_blocks": n_blocks, "block_hw": (h, w),
                        "ctx": ctx, "pred": pred})
@@ -435,25 +284,38 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
     ctx_enc = VideoEncoder(num_frames=cfg.num_frames, img_size=cfg.img_size, patch_size=cfg.patch_size).to(device); tgt_enc = copy.deepcopy(ctx_enc).to(device)
     for p in tgt_enc.parameters(): p.requires_grad_(False)
     pred = JEPAPredictor(t_grid=ctx_enc.t_grid, s_grid=ctx_enc.s_grid).to(device)
+    pool = AttentionPooling(ctx_enc.dim).to(device); tgt_pool = copy.deepcopy(pool).to(device)
+    for p in tgt_pool.parameters(): p.requires_grad_(False)
     print(f"tubelet grid: t={ctx_enc.t_grid} s={ctx_enc.s_grid} -> {ctx_enc.n_patches} patches")
     opt = torch.optim.AdamW(param_groups([ctx_enc, pred], wd), lr=lr)
     total = epochs * len(loader)
     losses = {g[0]: [] for g in MASK_GROUPS}; step = 0; D = ctx_enc.dim
+    tt_start, tt_end, tt_warm = cfg.tt_min, cfg.tt_max, cfg.tt_warm
+    # create teacher temp schedule for each epochss that starts from tt_start, ends at tt_end, and warms up for tt_warm epochs.
+    tt_schedule = [tt_start + (tt_end - tt_start) * min(1, epoch / tt_warm) for epoch in range(epochs)]
     for epoch in range(epochs):
         pbar = tqdm(loader)
-        for videos, flows in pbar:
-            videos = videos.to(device, non_blocking=True); B = videos.size(0); flows = flows.numpy()
-            groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng, flows=flows)
+        for videos in pbar:
+            videos = videos.to(device, non_blocking=True); B = videos.size(0)
+            groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng)
             with torch.no_grad(): full = F.layer_norm(tgt_enc(videos), (D,))
             per = {}
             for g in groups:
                 ci = torch.tensor(g["ctx"], device=device); pi = torch.tensor(g["pred"], device=device)
                 tgt = full.gather(1, pi.unsqueeze(-1).expand(-1, -1, D))
-                per[g["label"]] = (pred(ctx_enc(videos, ci), ci, pi) - tgt).abs().mean()
+                if g['label'] != 'ctr':
+                    # vjepa2 case
+                    per[g["label"]] = (pred(ctx_enc(videos, ci), ci, pi) - tgt).abs().mean()
+                else:
+                    # contrastive distillations
+                    p1, _ = pool(pred(ctx_enc(videos, ci), ci, pi)); p2, _ = tgt_pool(tgt) 
+                    p1 = F.softmax(p1 / cfg.ts, dim=-1); p2 = F.softmax(p2 / tt_schedule[epoch], dim=-1)
+                    # loss:  - p2 log p1 # read dino paper to see how sharpening teacher distri helps.
+                    per[g["label"]] = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
             loss = sum(per.values()) / len(per)
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
-            ema_update(tgt_enc, ctx_enc, m)
+            ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m)
             for k, v in per.items(): losses[k].append(v.item())
             
             if step % 25 == 0:
@@ -463,10 +325,10 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                     logger.log({"epoch": epoch, "step": step, "ema": m, **{f"loss_{k}": v.item() for k, v in per.items()}})
                     
             step += 1
+
         if logger:
             visuals, visual_interval = [], cfg.num_frames
-            for i, (videos, _) in enumerate(val_loader):
-                
+            for i, (videos) in enumerate(val_loader):
                 if i % visual_interval == 0:
                     videos = videos.to(device)
                     with torch.no_grad():
@@ -474,9 +336,12 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                         last_frame = videos[0, :, -1].permute(1, 2, 0).cpu()+0.5  # (H, W, C)
                         last_frame = ((last_frame).clamp(0, 1).numpy() * 255).astype(np.uint8)
                         tokens = ctx_enc(videos)[:1, -ctx_enc.s_grid * ctx_enc.s_grid:]
+                        attn_map = pool(tokens)[1].reshape(ctx_enc.s_grid, ctx_enc.s_grid).cpu().numpy()
                     pca_last_frame = visualize_tokens_pca(tokens, h=ctx_enc.s_grid, w=ctx_enc.s_grid).resize((cfg.img_size, cfg.img_size))
+                    attn_map_visual = visualize_attnmap(attn_map, size=(cfg.img_size, cfg.img_size))
+
                     # concatenate 
-                    visuals.append( np.concatenate([last_frame, np.array(pca_last_frame)], axis=1) )
+                    visuals.append( np.concatenate([last_frame, np.array(pca_last_frame), np.array(attn_map_visual)], axis=1) )
             visuals = np.array(visuals)
             # N x H x W x C -> (N*H) x W x C
             h, w = visuals.shape[1], visuals.shape[2]
@@ -492,11 +357,15 @@ class cfg:
     phase1_epochs=50
     batch_size=64
     episodes = 100
+    ts = 0.1 # student temp 
+    tt_min = 0.04 # teacher temp start
+    tt_max = 0.07 # teacher temp end
+    tt_warm = 3 # epochs
 
     # Logging 
     name='djepa' # or djepa
-    suffix = 'motion_topk'
-    use_wandb = True
+    suffix = 'ctr'
+    use_wandb = False
 
 def main(cfg,  device=None):
     device = device or pick_device(); print(f"device: {device}")
