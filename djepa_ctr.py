@@ -10,6 +10,7 @@ import torchvision.transforms as T
 
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
 ctr_gap = 2
+ctr_drop = (0.70, 0.85) # (0.3, 0.3) # (0.15, 0.85) # could drop 15% to 85% of patches
 
 def visualize_attnmap(map, size=(96, 96)):
     # map: (s_grid, s_grid)
@@ -17,8 +18,8 @@ def visualize_attnmap(map, size=(96, 96)):
     attn_map = (map - map.min()) / (map.max() - map.min() + 1e-8)  # normalize to [0, 1]
     attn_map = cv2.resize(attn_map, size, interpolation=cv2.INTER_CUBIC)  # upsample to image size
     attn_map = (attn_map * 255).astype(np.uint8)  # convert to uint8
-    # (H, W) -> (H, W, 3) 
-    attn_map = np.stack([attn_map] * 3, axis=-1)
+    attn_map = cv2.applyColorMap(attn_map, cv2.COLORMAP_OCEAN)       # (H, W, 3) BGR
+    attn_map = cv2.cvtColor(attn_map, cv2.COLOR_BGR2RGB)   # → RGB
 
     return Image.fromarray(attn_map)
 
@@ -163,7 +164,7 @@ class RobomimicVideos(Dataset):
 
 class VideoEncoder(nn.Module):
     def __init__(self, num_frames=10, t_patch=2, img_size=64, patch_size=8,
-                 in_chans=3, dim=128, depth=6, heads=4):
+                 in_chans=3, dim=128, depth=6, heads=4, num_registers = 4):
         super().__init__()
         self.t_grid = num_frames // t_patch; self.s_grid = img_size // patch_size
         self.n_patches = self.t_grid * self.s_grid * self.s_grid
@@ -174,16 +175,27 @@ class VideoEncoder(nn.Module):
         self.register_buffer("pos", sincos_3d(self.t_grid, self.s_grid, self.s_grid, dim))
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.num_registers = num_registers
+        # Add registers number of learnable tokens at the beginning of the sequence.
+        self.registers = nn.Parameter(torch.zeros(1, num_registers, dim)) if num_registers > 0 else None
+        # self.registers = nn.Parameter(torch.randn(1, num_registers, dim) * 0.02) if num_registers > 0 else None
 
     def forward(self, videos, idx=None):
         tokens = self.tubelet_proj(videos).flatten(2).transpose(1, 2)
         B, N, D = tokens.shape
+
         if idx is None:
             idx = torch.arange(N, device=videos.device).expand(B, -1); x = tokens + self.pos[idx]
         else:
             x = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, D)) + self.pos[idx]
+        if self.num_registers > 0:
+            x = torch.cat([self.registers.expand(B, -1, -1), x], dim=1)
+
         for blk in self.blocks: x = blk(x)
-        return self.norm(x)
+        x = self.norm(x)
+        if self.num_registers > 0:
+            x = x[:, self.num_registers:]
+        return x
 
 class JEPAPredictor(nn.Module):
     def __init__(self, t_grid, s_grid, enc_dim=128, dim=64, depth=4, heads=4):
@@ -212,19 +224,60 @@ class CausalBlock(nn.Module):
         h = self.n1(x); x = x + self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
         return x + self.mlp(self.n2(x))
 
+class DINOCentering(nn.Module):
+    def __init__(self, out_dim, momentum=0.9):
+        super().__init__()
+        self.momentum = momentum
+
+        self.register_buffer(
+            "center",
+            torch.zeros(1, out_dim)
+        )
+
+    @torch.no_grad()
+    def update_center(self, teacher_logits):
+        batch_center = teacher_logits.mean(dim=0, keepdim=True)
+
+        self.center.mul_(self.momentum).add_(
+            batch_center,
+            alpha=1 - self.momentum
+        )
+
+    def forward(self, teacher_logits, teacher_temp):
+        centered_logits = teacher_logits - self.center
+        return F.softmax(centered_logits / teacher_temp, dim=-1)
+    
+# class AttentionPooling(nn.Module):
+#     # convert each token to a weight via MLP, and take the weighted average of the tokens as output.
+#     # then, output a softmax distribution
+#     def __init__(self, in_dim, hidden_dim = 512, out_dim = 256):
+#         super().__init__()
+#         self.mlp = nn.Sequential(nn.LayerNorm(in_dim, eps=1e-6), nn.Linear(in_dim, 1) )
+#         self.out = nn.Sequential( nn.LayerNorm(in_dim, eps=1e-6), nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim) )
+#     def forward(self, tokens):
+#         weights = self.mlp(tokens).squeeze(-1)  # (B N D) -> (B, N)
+#         weights = F.softmax(weights, dim=-1)  # (B, N)
+#         pooled = (tokens * weights.unsqueeze(-1)).sum(dim=1)  # (B, D)
+#         logits = self.out(pooled)  # (B, out_dim)
+#         return logits, weights
+
 class AttentionPooling(nn.Module):
-    # convert each token to a weight via MLP, and take the weighted average of the tokens as output.
-    # then, output a softmax distribution
+    # maintain a learnable query vector, and do cross-attention to get a pooled information (N tokens --> 1 token)
+    # then, output a softmax distribution 
     def __init__(self, in_dim, hidden_dim = 512, out_dim = 256):
         super().__init__()
-        self.mlp = nn.Sequential(nn.LayerNorm(in_dim, eps=1e-6), nn.Linear(in_dim, 1) )
+        self.query = nn.Parameter(torch.zeros(1, 1, in_dim)); nn.init.trunc_normal_(self.query, std=0.02)
+        self.cross_attn = nn.MultiheadAttention(in_dim, 1, batch_first=True)
+       
         self.out = nn.Sequential( nn.LayerNorm(in_dim, eps=1e-6), nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim) )
-    def forward(self, tokens):
-        weights = self.mlp(tokens).squeeze(-1)  # (B N D) -> (B, N)
-        weights = F.softmax(weights, dim=-1)  # (B, N)
-        pooled = (tokens * weights.unsqueeze(-1)).sum(dim=1)  # (B, D)
-        logits = self.out(pooled)  # (B, out_dim)
-        return logits, weights
+    def forward(self, tokens, mask=None):
+        B = tokens.size(0)
+        query = self.query.expand(B, -1, -1)  # (B, 1, in_dim)
+        attn_output, weights = self.cross_attn(query, tokens, tokens, attn_mask=mask, need_weights=True, average_attn_weights=False)  # (B, 1, in_dim), (B, heads, 1, N)
+        if len(weights.shape) == 4:
+            weights = weights.max(1)[0] # (B, heads, 1, N) -> (B, 1, N)
+        logits = self.out(attn_output.squeeze(1))  # (B, out_dim)
+        return logits, weights.squeeze(1)  # (B, out_dim), (B, N)
 
 def _bsize(g, s, ar=1.0):
     a = s * g * g
@@ -247,6 +300,18 @@ def _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells):
         if len(visible) >= min_visible_cells:
             return masked, visible
     return best
+
+def random_drop_mask(B, S, p, device='cpu'):
+    """
+    Args:
+        B: batch size
+        S: sequence length (number of patches)
+        p: drop probability, e.g. 0.3 drops 30% of patches
+        device: torch device
+    Returns:
+        mask: (B, S) boolean tensor, True = keep, False = drop
+    """
+    return torch.rand(B, S, device=device) >= p
 
 def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5)):
     rng = rng or random
@@ -282,12 +347,13 @@ def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1
 def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema_start=0.99925, ema_end=0.99925, logger = None):
     print("=== Phase 1: V-JEPA pretraining ===")
     ctx_enc = VideoEncoder(num_frames=cfg.num_frames, img_size=cfg.img_size, patch_size=cfg.patch_size).to(device); tgt_enc = copy.deepcopy(ctx_enc).to(device)
+    centering =  DINOCentering(256).to(device)  # for centering teacher output in contrastive distillation
     for p in tgt_enc.parameters(): p.requires_grad_(False)
     pred = JEPAPredictor(t_grid=ctx_enc.t_grid, s_grid=ctx_enc.s_grid).to(device)
     pool = AttentionPooling(ctx_enc.dim).to(device); tgt_pool = copy.deepcopy(pool).to(device)
     for p in tgt_pool.parameters(): p.requires_grad_(False)
     print(f"tubelet grid: t={ctx_enc.t_grid} s={ctx_enc.s_grid} -> {ctx_enc.n_patches} patches")
-    opt = torch.optim.AdamW(param_groups([ctx_enc, pred], wd), lr=lr)
+    opt = torch.optim.AdamW(param_groups([ctx_enc, pred, pool], wd), lr=lr)
     total = epochs * len(loader)
     losses = {g[0]: [] for g in MASK_GROUPS}; step = 0; D = ctx_enc.dim
     tt_start, tt_end, tt_warm = cfg.tt_min, cfg.tt_max, cfg.tt_warm
@@ -308,21 +374,23 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                     per[g["label"]] = (pred(ctx_enc(videos, ci), ci, pi) - tgt).abs().mean()
                 else:
                     # contrastive distillations
-                    p1, _ = pool(pred(ctx_enc(videos, ci), ci, pi)); p2, _ = tgt_pool(tgt) 
-                    p1 = F.softmax(p1 / cfg.ts, dim=-1); p2 = F.softmax(p2 / tt_schedule[epoch], dim=-1)
+                    student_out = pred(ctx_enc(videos, ci), ci, pi)
+                    mask = random_drop_mask(*student_out.shape[:2], p=rng.uniform(*ctr_drop), device = device).unsqueeze(1)
+                    p1, _ = pool(student_out, mask=mask); p2, _ = tgt_pool(tgt) 
+                    p1 = F.softmax(p1 / cfg.ts, dim=-1); p2 = centering(p2, tt_schedule[epoch])  # p2 = F.softmax(p2 / tt_schedule[epoch], dim=-1)
                     # loss:  - p2 log p1 # read dino paper to see how sharpening teacher distri helps.
                     per[g["label"]] = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
             loss = sum(per.values()) / len(per)
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
-            ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m)
+            ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m); centering.update_center(p2)
             for k, v in per.items(): losses[k].append(v.item())
             
             if step % 25 == 0:
                 msg = " ".join(f"{k}={v.item():.4f}" for k, v in per.items())
                 pbar.set_postfix_str(f"ep={epoch} {msg} ema={m:.4f}")
                 if logger:
-                    logger.log({"epoch": epoch, "step": step, "ema": m, **{f"loss_{k}": v.item() for k, v in per.items()}})
+                    logger.log({"epoch": epoch, "step": step, "ema": m, 'temp_teacher': tt_schedule[epoch], **{f"loss_{k}": v.item() for k, v in per.items()}})
                     
             step += 1
 
@@ -354,7 +422,7 @@ class cfg:
     img_size = 96
     patch_size = 8 # 8 works for lifting, too blury for can.
     num_frames = 8
-    phase1_epochs=50
+    phase1_epochs= 50
     batch_size=64
     episodes = 100
     ts = 0.1 # student temp 
@@ -365,7 +433,7 @@ class cfg:
     # Logging 
     name='djepa' # or djepa
     suffix = 'ctr'
-    use_wandb = False
+    use_wandb = True
 
 def main(cfg,  device=None):
     device = device or pick_device(); print(f"device: {device}")

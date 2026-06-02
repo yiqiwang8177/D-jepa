@@ -14,4 +14,4 @@
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate djepa
 
-srun python djepa.py
+srun python djepa_ctr.py
