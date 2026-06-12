@@ -3,17 +3,19 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm 
 from einops import rearrange
-import os, copy, math, random, wandb, cv2
+import gc, os, copy, math, random, wandb, cv2
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from sklearn.decomposition import PCA
 import torchvision.transforms as T
 
-MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
+MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7)]
+ctr_lam = 2
 ctr_gap = 1
-ctr_distills = 0
+ctr_distills = 2 # 3
 ctr_drop = (0.70, 0.85) # (0.3, 0.3) # (0.15, 0.85) # could drop 15% to 85% of patches
 ctr_drop_small = (0, 0) # no drops (0.15, 0.3) 
+DJEPA_MASK_GROUPS = [("ctr", 8, 0.15)] * ctr_distills + [("ctr_distill", 2, 0.15)] # 
 
 def visualize_attnmap(map, size=(96, 96)):
     # map: (s_grid, s_grid)
@@ -295,24 +297,6 @@ class AttentionPooling(nn.Module):
         pooled = (tokens * weights.unsqueeze(-1)).sum(dim=1)
         return self.out(pooled), weights
     
-# class AttentionPooling(nn.Module):
-#     # maintain a learnable query vector, and do cross-attention to get a pooled information (N tokens --> 1 token)
-#     # then, output a softmax distribution 
-#     def __init__(self, in_dim, hidden_dim = 512, out_dim = 256):
-#         super().__init__()
-#         self.query = nn.Parameter(torch.zeros(1, 1, in_dim)); nn.init.trunc_normal_(self.query, std=0.02)
-#         self.cross_attn = nn.MultiheadAttention(in_dim, 1, batch_first=True, dropout=0.1)
-       
-#         self.out = nn.Sequential( nn.LayerNorm(in_dim, eps=1e-6), nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim) )
-#     def forward(self, tokens, mask=None):
-#         B = tokens.size(0)
-#         query = self.query.expand(B, -1, -1)  # (B, 1, in_dim)
-#         attn_output, weights = self.cross_attn(query, tokens, tokens, attn_mask=mask, need_weights=True, average_attn_weights=False)  # (B, 1, in_dim), (B, heads, 1, N)
-#         if len(weights.shape) == 4:
-#             weights = weights.max(1)[0] # (B, heads, 1, N) -> (B, 1, N)
-#         logits = self.out(attn_output.squeeze(1))  # (B, out_dim)
-#         return logits, weights.squeeze(1)  # (B, out_dim), (B, N)
-
 def _bsize(g, s, ar=1.0):
     a = s * g * g
     return (max(1, min(g, round(math.sqrt(a * ar)))), max(1, min(g, round(math.sqrt(a / ar)))))
@@ -347,33 +331,28 @@ def random_drop_mask(B, S, p, device='cpu'):
     """
     return torch.rand(B, S, device=device) >= p
 
-def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5)):
+def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5), djepa=False):
     rng = rng or random
     min_visible_cells = max(1, math.ceil(min_ctx / t_grid))
     groups = []
-    for label, n_blocks, scale in MASK_GROUPS:
+    GROUPS = MASK_GROUPS if not djepa else DJEPA_MASK_GROUPS
+    for label, n_blocks, scale in GROUPS:
         h, w = _bsize(s_grid, scale, rng.uniform(*ar_range))
         ctx_spatial, pred_spatial = [], []
-        if label != "ctr":
-            for _ in range(B):
-                masked, visible = _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells)
-                ctx_spatial.append(sorted(visible)); pred_spatial.append(sorted(masked))
-            # all items in the batch have identical-length index lists
-            Lc, Lp = min(len(c) for c in ctx_spatial), min(len(p) for p in pred_spatial)
-            
-            ctx = [_expand_tubes(sorted(rng.sample(c, Lc)), t_grid, s_grid) for c in ctx_spatial]
-            pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
-        else:
-            ctx, pred = [], []
-            # randomly masked out all patches at frame i, and set patches not from frame i to be visible context.
-            # all patches from frame j = (i + ctr_gap) % t_grid to be prediction target. Learn arbitrary neighbor frames to be have similar background.
-            for _ in range(B):
-                i = rng.randint(0, t_grid - 1); j = (i + ctr_gap) % t_grid
-                visible = [p for p in range(t_grid * s_grid * s_grid) if not (i * s_grid * s_grid <= p < (i + 1) * s_grid * s_grid)]
-                ctx.append(visible)
-                masked = list(range(j * s_grid * s_grid, (j + 1) * s_grid * s_grid))
-                pred.append(masked)
-            
+
+        for _ in range(B):
+            masked, visible = _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells)
+            # if djepa:
+            #     print('\t\tDebug:', len(masked), len(visible))
+            ctx_spatial.append(sorted(visible)); pred_spatial.append(sorted(masked))
+        # all items in the batch have identical-length index lists
+        Lc, Lp = min(len(c) for c in ctx_spatial), min(len(p) for p in pred_spatial)
+        
+        ctx = [_expand_tubes(sorted(rng.sample(c, Lc)), t_grid, s_grid) for c in ctx_spatial]
+        pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
+        # if djepa:
+        #     print( f"\tDebug: {Lc} {Lp} {len(ctx)} {len(pred)}" )
+        
         groups.append({"label": label, "n_blocks": n_blocks, "block_hw": (h, w),
                        "ctx": ctx, "pred": pred})
     return groups
@@ -396,16 +375,13 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
     total = epochs * len(loader)
     losses = {g[0]: [] for g in MASK_GROUPS}; step = 0; D = ctx_enc.dim
     if cfg.ctr_distill:
-        losses['ctr_distill'] = []
+        losses['ctr_distill'] = []; losses['ctr'] = []
     tt_start, tt_end, tt_warm = cfg.tt_min, cfg.tt_max, cfg.tt_warm
     # create teacher temp schedule for each epochss that starts from tt_start, ends at tt_end, and warms up for tt_warm epochs.
     tt_schedule = [tt_start + (tt_end - tt_start) * min(1, epoch / tt_warm) for epoch in range(epochs)]
     for epoch in range(epochs):
         pbar = tqdm(loader)
         for videos in pbar:
-            if cfg.ctr_shift: # Bx(2xC)xTxHxW
-                videos, ctr_videos = torch.chunk(videos, 2, dim=1)
-                ctr_videos = ctr_videos.to(device, non_blocking=True)
            
             videos = videos.to(device, non_blocking=True); B = videos.size(0)
             groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng)
@@ -417,91 +393,63 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                 pred_patches = pred(ctx_enc(videos, ci), ci, pi)
                 # vjepa2 case
                 per[g["label"]] = (pred_patches - tgt).abs().mean()
-                if cfg.suffix == 'ctr':
-                    if g["label"] == 'long' and cfg.suffix2 == 'short':
-                        continue
+            
+            # contrastive distillation
+      
+            if cfg.suffix == 'ctr' and cfg.ctr_distill:
+                per['ctr'] = per['ctr_distill'] = 0
+                global_patches = rearrange(full,   'b (t n) d -> (b t) n d', t=ctx_enc.t_grid)
+                groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng, djepa=True)
+                with torch.no_grad(): p2 = centering(tgt_pool(global_patches)[0], tt_schedule[epoch]).detach()
+                p2_expand = rearrange(p2, '(b t) d -> b t d', t=ctx_enc.t_grid).detach()
+                for g in groups:
+                    # create a local spatial-temporal crop
                     
-                    if cfg.ctr_shift:
-                        with torch.no_grad(): full_shift = F.layer_norm(tgt_enc(ctr_videos), (D,))
-                    # local "crops" per timestep
-                    i = rng.randint(0, ctx_enc.t_grid - 1)
-                    j = sample_j(i, ctx_enc.t_grid, ctr_gap, rng)
-
-                    # (b, n, d) — single frame for each sample in batch
-                    local_patches  = rearrange(pred_patches, 'b (t m) d -> b t m d', t=ctx_enc.t_grid)
-                    aligned_local_paches = rearrange(local_patches, ' b t m d -> (b t) m d')                #<-- for aligned comparisons
-                    local_patches = local_patches[:, i]                                                     #<-- for shifted comparions
-                    global_patches = rearrange(full_shift,   'b (t n) d -> b t n d', t=ctx_enc.t_grid)[:, j]#<-- for shifted comparions
-                    aligned_global_patches = rearrange(full,   'b (t n) d -> (b t) n d', t=ctx_enc.t_grid)  #<-- for aligned comparisons
-
+                    ci = torch.tensor(g["ctx"], device=device); #  pi = torch.tensor(g["pred"], device=device)
+                    local_patches = ctx_enc(videos, ci)
+                    # pred_local_patches = rearrange(pred(local_patches,  ci, pi), 'b (t z) d -> (b t) z d', t=ctx_enc.t_grid)            
+                    local_patches  = rearrange(local_patches, 'b (t m) d -> (b t) m d', t=ctx_enc.t_grid)
+                    
                     B, M, D = local_patches.shape
                     N = global_patches.shape[1]
-
-                    # Unaligned comparisons for non-dynamics
+                    # Non-dynamics comparisons
                     p1 = F.softmax(pool(local_patches)[0] / cfg.ts, dim=-1)  
-                    with torch.no_grad(): p2 = centering(tgt_pool(global_patches)[0], tt_schedule[epoch]).detach()
-                    loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
-                    if cfg.ctr_distill:
-                        # p1_ctr = F.softmax(pool_ctr(local_patches)[0]/ cfg.ts, dim=-1)  
-                        # Unaligned contrastive distillation for dynamics <-- create difficulty for ctr loss
-                        # loss += (p2 * (p1_ctr + 1e-8).log()).sum(dim=-1).mean()
-                        # Aligned contrasive distillation for dynamics
-                        p1_ctr_align = F.softmax(pool_ctr(aligned_local_paches)[0]/ cfg.ts, dim=-1)  
-                        with torch.no_grad(): aligned_p2 = centering(tgt_pool(aligned_global_patches)[0], tt_schedule[epoch]).detach()
-                        ctr_loss = (aligned_p2 * (p1_ctr_align + 1e-8).log()).sum(dim=-1).mean()
-                        per['ctr_distill'] = ctr_loss
-                    per['ctr'] = loss
+                    p1 = rearrange(p1, '(b t) d -> b t d', t=ctx_enc.t_grid)
+                    ce = -(p2_expand.unsqueeze(2) * (p1 + 1e-8).log().unsqueeze(1)).sum(dim=-1) # B x T x T
 
-                # else:
-                    # contrastive distillations
-                    ####### Version1: predicting an entire missing frames. Encoder & Predictor
-                    # student_out = pred(ctx_enc(videos, ci), ci, pi)
-                    # with torch.no_grad():
-                    #     p2, _ = tgt_pool(tgt)
-                    #     p2 = centering(p2, tt_schedule[epoch]).detach() # p2 = F.softmax(p2 / tt_schedule[epoch], dim=-1)
-                    # loss = 0 
-                    # for _ctr_drop in [ctr_drop]*ctr_distills + [ctr_drop_small]:
-                    #     mask = random_drop_mask(*student_out.shape[:2], p=rng.uniform(*_ctr_drop), device = device).unsqueeze(1)
-                    #     p1, attn_dist = pool(student_out, masks=mask)
-                    #     p1 = F.softmax(p1 / cfg.ts, dim=-1)  
-                    #     loss += -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
-                    # attn_entropy = - attn_dist * (attn_dist + 1e-8).log()
-                    # loss -= cfg.attn_reg * (attn_entropy).sum(dim=-1).mean()
-                        
-                    ####### Version2: random sample patches from a timestep. Encoder ONLY. No Predictor.
-                    # i,j, patches = rng.randint(0, ctx_enc.t_grid-1), rng.randint(0, ctx_enc.t_grid-1), ctx_enc.s_grid **2
-                    # student_out, teacher_out = ctx_enc(videos)[:, i*patches:(i+1)*patches], full[:, j*patches:(j+1)*patches]
-                    # loss = 0
-                    # with torch.no_grad():
-                    #     p2, _ = tgt_pool(teacher_out) 
-                    #     p2 = centering(p2, tt_schedule[epoch]).detach()
-                    # for _ctr_drop in [ctr_drop]*ctr_distills + [ctr_drop_small]:
-                    #     mask = random_drop_mask(*student_out.shape[:2], p=rng.uniform(*_ctr_drop), device = device).unsqueeze(1)
-                    #     p1, _ = pool(student_out, mask=mask)
-                    #     p1 = F.softmax(p1 / cfg.ts, dim=-1)
-                    #     # loss:  - p2 log p1 # read dino paper to see how sharpening teacher distri helps.
-                    #     loss += -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
+                    idx = torch.arange(ctx_enc.t_grid, device=p1.device)
+                    dist = (idx[:, None] - idx[None, :]).abs()  # T x T
+                    weights = 1.0 / (ctr_lam + dist)   
+                    loss = (ce * weights).sum(dim=(1, 2)) / weights.sum()
+                    per['ctr'] += loss.mean() 
                     
-                    # per[g["label"]] = loss / (ctr_distills+1)
-                    # losses['attn_entropy'] = []; per['attn_entropy'] = attn_entropy.sum(dim=-1).mean()
+                    if cfg.ctr_distill and g["label"] == 'ctr_distill':
+                        # Aligned contrasive distillation for dynamics
+                        p1_ctr_align = F.softmax(pool_ctr(local_patches)[0]/ cfg.ts, dim=-1)
+                        # p1_ctr_align = F.softmax(pool_ctr(pred_local_patches)[0]/ cfg.ts, dim=-1)
+                        ctr_loss = (p2 * (p1_ctr_align + 1e-8).log()).sum(dim=-1).mean()
+                        per['ctr_distill'] += ctr_loss 
+                # per['ctr_distill'] /= ctr_distills
+                per['ctr'] /= ctr_distills
+      
             loss = sum(per.values()) / len(per)
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
             ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m)
-            logits_to_update = p2 if not cfg.ctr_distill else torch.cat([p2, aligned_p2], dim=0)
-            centering.update_center(logits_to_update)
+            if cfg.suffix == 'ctr' and cfg.ctr_distill:
+                centering.update_center(p2)
             for k, v in per.items(): losses[k].append(v.item())
-            
             if step % 25 == 0:
                 msg = " ".join(f"{k}={v.item():.4f}" for k, v in per.items())
                 pbar.set_postfix_str(f"ep={epoch} {msg} ema={m:.4f}")
                 if logger:
                     logger.log({"epoch": epoch, "step": step, "ema": m, 'temp_teacher': tt_schedule[epoch], **{f"loss_{k}": v.item() for k, v in per.items()}})
+
                     
             step += 1
 
         if logger:
-            visuals, visual_interval = [], cfg.num_frames * 2
+            visuals, visual_interval = [], cfg.num_frames 
             for i, (videos) in enumerate(val_loader):
                 if i % visual_interval == 0:
                     videos = videos.to(device)
@@ -540,22 +488,22 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
 class cfg:
     img_size = 96
     patch_size = 8 # 8 works for lifting, too blury for can.
-    num_frames = 8
+    num_frames = 16 # 8
     phase1_epochs= 50
-    batch_size= 128 # 64
+    batch_size= 64
     episodes = 100
     ts = 0.1 # student temp 
     tt_min = 0.04 # teacher temp start
     tt_max = 0.07 # teacher temp end
     tt_warm = 3 # epochs
     attn_reg = 0 # regularize entropy
-    ctr_shift = True
+    ctr_shift = False
     ctr_distill = True
 
     # Logging 
     name='djepa' # or djepa
     suffix = 'ctr'
-    suffix2 = 'short'
+    suffix2 = 'long'
     use_wandb = True
 
 def main(cfg,  device=None):
@@ -565,16 +513,15 @@ def main(cfg,  device=None):
     val_ds = RobomimicVideos(robots=['panda'], episodes=1, cfg= cfg, rng=random.Random(0), img_size=cfg.img_size, num_frames=cfg.num_frames)
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=8, prefetch_factor=4, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, drop_last=True)
-
+    if "vjepa" in cfg.name:
+        global MASK_GROUPS
+        MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7)]; cfg.suffix = ''; cfg.ctr_distill=False
     logger = init_logger(
         cfg.use_wandb,
         project="djepa-playground",
         name=f"{cfg.name}-pretrain-{cfg.suffix}-{cfg.suffix2}",
         config=vars(cfg)
     )
-    if cfg.name == "vjepa2":
-        global MASK_GROUPS
-        MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7)]
     
     encoder, p1 = pretrain(cfg, loader, val_loader, rng, cfg.phase1_epochs, device, logger=logger)
     return {"encoder": encoder, "loader": loader, "device": device, "losses": p1}

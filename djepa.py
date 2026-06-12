@@ -109,7 +109,7 @@ def pick_device():
     return "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 class RobomimicVideos(Dataset):
-    def __init__(self, cfg, rng, robots=['panda', 'kinova3', 'ur5e'], tasks=['can'], stats_root = "/zfsauton/scratch/yiqiw2/robomimic_datasets_stats/robomimic_multi_new", png_root="/zfsauton/scratch/yiqiw2/robomimic_datasets", num_frames=8, img_size=128, episodes=100):
+    def __init__(self, cfg, rng, robots=['panda', 'kinova3', 'ur5e'], tasks=['can', 'lift', 'square'], stats_root = "/zfsauton/scratch/yiqiw2/robomimic_datasets_stats/robomimic_multi_new", png_root="/zfsauton/scratch/yiqiw2/robomimic_datasets", num_frames=8, img_size=128, episodes=100):
         self.cfg = cfg
         self.rng = rng
         self.png_root = png_root; self.num_frames = num_frames; self.img_size = img_size
@@ -464,18 +464,19 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                     
             step += 1
         if logger:
-            visuals, visual_interval = [], cfg.num_frames
+            visuals, visual_interval = [], cfg.num_frames * 2
             for i, (videos, _) in enumerate(val_loader):
                 
                 if i % visual_interval == 0:
                     videos = videos.to(device)
                     with torch.no_grad():
                         # video: B x C x T x H x W --> B x T x H x W C
-                        last_frame = videos[0, :, -1].permute(1, 2, 0).cpu()+0.5  # (H, W, C)
-                        last_frame = ((last_frame).clamp(0, 1).numpy() * 255).astype(np.uint8)
-                        tokens = ctx_enc(videos)[:1, -ctx_enc.s_grid * ctx_enc.s_grid:]
-                    pca_last_frame = visualize_tokens_pca(tokens, h=ctx_enc.s_grid, w=ctx_enc.s_grid).resize((cfg.img_size, cfg.img_size))
+                        first_frame = videos[0, :, 0].permute(1, 2, 0).cpu()+0.5; last_frame = videos[0, :, -1].permute(1, 2, 0).cpu()+0.5  # (H, W, C)
+                        first_frame = ((first_frame).clamp(0, 1).numpy() * 255).astype(np.uint8); last_frame = ((last_frame).clamp(0, 1).numpy() * 255).astype(np.uint8)
+                        first_tokens = ctx_enc(videos)[:1, :ctx_enc.s_grid * ctx_enc.s_grid];  last_tokens = ctx_enc(videos)[:1, -ctx_enc.s_grid * ctx_enc.s_grid:]
+                    pca_first_frame = visualize_tokens_pca(first_tokens, h=ctx_enc.s_grid, w=ctx_enc.s_grid).resize((cfg.img_size, cfg.img_size)); pca_last_frame = visualize_tokens_pca(last_tokens, h=ctx_enc.s_grid, w=ctx_enc.s_grid).resize((cfg.img_size, cfg.img_size))
                     # concatenate 
+                    visuals.append( np.concatenate([first_frame, np.array(pca_first_frame)], axis=1) )
                     visuals.append( np.concatenate([last_frame, np.array(pca_last_frame)], axis=1) )
             visuals = np.array(visuals)
             # N x H x W x C -> (N*H) x W x C
@@ -490,12 +491,12 @@ class cfg:
     patch_size = 8 # 8 works for lifting, too blury for can.
     num_frames = 8
     phase1_epochs=50
-    batch_size=64
+    batch_size=128 # 64
     episodes = 100
 
     # Logging 
-    name='djepa' # or djepa
-    suffix = 'motion_topk'
+    name='vjepa' # or djepa
+    suffix = '' # '-motion_topk'
     use_wandb = True
 
 def main(cfg,  device=None):
@@ -509,10 +510,10 @@ def main(cfg,  device=None):
     logger = init_logger(
         cfg.use_wandb,
         project="djepa-playground",
-        name=f"{cfg.name}-pretrain-{cfg.suffix}",
+        name=f"{cfg.name}-pretrain{cfg.suffix}",
         config=vars(cfg)
     )
-    if cfg.name == "vjepa2":
+    if "vjepa" in cfg.name:
         global MASK_GROUPS
         MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7)]
     
