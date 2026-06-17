@@ -192,7 +192,6 @@ class ACPredictor(nn.Module):
             z_seq = torch.cat([z_seq, pred[:, None]], dim=1); out.append(pred)
         return torch.stack(out, dim=1)
 
-
 def _bsize(g, s, ar=1.0):
     a = s * g * g
     return (max(1, min(g, round(math.sqrt(a * ar)))), max(1, min(g, round(math.sqrt(a / ar)))))

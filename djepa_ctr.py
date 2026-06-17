@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 from sklearn.decomposition import PCA
 import torchvision.transforms as T
 
+
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
 ctr_gap = 1
 ctr_distills = 0
@@ -283,7 +284,7 @@ class AttentionPooling(nn.Module):
         self.scorer = nn.Linear(in_dim, 1)
         self.out = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim))
 
-    def forward(self, tokens, masks=None):
+    def forward(self, tokens, masks=None, invert=False):
         tokens = self.norm(tokens)               # normalize once
         logits = self.scorer(tokens).squeeze(-1)  # (B, N)
 
@@ -292,27 +293,60 @@ class AttentionPooling(nn.Module):
                 masks = masks.squeeze(1) # B,1,N -> (B, N)
             logits = logits.masked_fill(~masks, float('-inf'))
         weights = F.softmax(logits, dim=-1)       # (B, N)
+        if invert:
+            weights = 1.0 - weights
+            weights = weights / weights.sum(dim=-1, keepdim=True)
         pooled = (tokens * weights.unsqueeze(-1)).sum(dim=1)
         return self.out(pooled), weights
-    
-# class AttentionPooling(nn.Module):
-#     # maintain a learnable query vector, and do cross-attention to get a pooled information (N tokens --> 1 token)
-#     # then, output a softmax distribution 
-#     def __init__(self, in_dim, hidden_dim = 512, out_dim = 256):
-#         super().__init__()
-#         self.query = nn.Parameter(torch.zeros(1, 1, in_dim)); nn.init.trunc_normal_(self.query, std=0.02)
-#         self.cross_attn = nn.MultiheadAttention(in_dim, 1, batch_first=True, dropout=0.1)
-       
-#         self.out = nn.Sequential( nn.LayerNorm(in_dim, eps=1e-6), nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim) )
-#     def forward(self, tokens, mask=None):
-#         B = tokens.size(0)
-#         query = self.query.expand(B, -1, -1)  # (B, 1, in_dim)
-#         attn_output, weights = self.cross_attn(query, tokens, tokens, attn_mask=mask, need_weights=True, average_attn_weights=False)  # (B, 1, in_dim), (B, heads, 1, N)
-#         if len(weights.shape) == 4:
-#             weights = weights.max(1)[0] # (B, heads, 1, N) -> (B, 1, N)
-#         logits = self.out(attn_output.squeeze(1))  # (B, out_dim)
-#         return logits, weights.squeeze(1)  # (B, out_dim), (B, N)
 
+class ACPredictor(nn.Module):
+    """Block-causal action/state-conditioned predictor for next latent frame."""
+
+    def __init__(self, s_grid, enc_dim=128, dim=128, depth=4, heads=4, action_dim=2, ):
+        super().__init__()
+        self.in_proj = nn.Linear(enc_dim, dim); self.out_proj = nn.Linear(dim, enc_dim)
+        self.action_proj = nn.Sequential(nn.Linear(action_dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        # self.state_proj = nn.Sequential(nn.Linear(state_dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.register_buffer("pos", sincos_2d(s_grid, s_grid, dim))
+        self.register_buffer("act_token", torch.zeros(1, 1, dim))
+        self.register_buffer("state_token", torch.zeros(1, 1, dim))
+        self.blocks = nn.ModuleList([CausalBlock(dim, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+
+    @staticmethod
+    def _block_causal_mask(T, width, device):
+        t = torch.arange(T, device=device).repeat_interleave(width)
+        return t[:, None] < t[None, :]  # True entries are masked by MultiheadAttention.
+
+    def forward(self, z, actions):
+        B, T, S, _ = z.shape
+        a = self.action_proj(actions).unsqueeze(2) + self.act_token
+        x = self.in_proj(z) + self.pos[None, None]
+        x = torch.cat([a, x], dim=2).reshape(B, T * (S + 1), -1)
+        mask = self._block_causal_mask(T, S + 1, z.device)
+        for blk in self.blocks: x = blk(x, mask)
+        x = self.norm(x).view(B, T, S + 1, -1)[:, :, 1:]
+        return self.out_proj(x)
+
+    def rollout(self, z0, actions):
+        z_seq = z0[:, None]; out = []
+        for k in range(actions.size(1)):
+            pred = self.forward(z_seq, actions[:, :k + 1])[:, -1]
+            z_seq = torch.cat([z_seq, pred[:, None]], dim=1); out.append(pred)
+        return torch.stack(out, dim=1)
+    
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+    
 def _bsize(g, s, ar=1.0):
     a = s * g * g
     return (max(1, min(g, round(math.sqrt(a * ar)))), max(1, min(g, round(math.sqrt(a / ar)))))
@@ -414,10 +448,11 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
             for g in groups:
                 ci = torch.tensor(g["ctx"], device=device); pi = torch.tensor(g["pred"], device=device)
                 tgt = full.gather(1, pi.unsqueeze(-1).expand(-1, -1, D))
-                pred_patches = pred(ctx_enc(videos, ci), ci, pi)
+                encoded_patches = ctx_enc(videos, ci) 
+                pred_patches = pred(encoded_patches, ci, pi)
                 # vjepa2 case
                 per[g["label"]] = (pred_patches - tgt).abs().mean()
-                if cfg.suffix == 'ctr':
+                if 'ctr' in cfg.suffix:
                     if g["label"] == 'long' and cfg.suffix2 == 'short':
                         continue
                     
@@ -428,27 +463,60 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                     j = sample_j(i, ctx_enc.t_grid, ctr_gap, rng)
 
                     # (b, n, d) — single frame for each sample in batch
-                    local_patches  = rearrange(pred_patches, 'b (t m) d -> b t m d', t=ctx_enc.t_grid)
-                    aligned_local_paches = rearrange(local_patches, ' b t m d -> (b t) m d')                #<-- for aligned comparisons
-                    local_patches = local_patches[:, i]                                                     #<-- for shifted comparions
+                    if not cfg.ctr_ctxonly:
+                        local_patches  = rearrange(pred_patches, 'b (t m) d -> b t m d', t=ctx_enc.t_grid)
+                        aligned_local_patches = rearrange(local_patches, ' b t m d -> (b t) m d')                #<-- for aligned comparisons
+                        local_patches = local_patches[:, i]    
+                    if cfg.ctr_full:
+                        aligned_local_ctx_patches = rearrange(encoded_patches, 'b (t m) d -> b t m d', t=ctx_enc.t_grid)
+                        local_ctx_patches = aligned_local_ctx_patches[:, i]
+                        aligned_local_ctx_patches = rearrange(aligned_local_ctx_patches, 'b t m d -> (b t) m d', t=ctx_enc.t_grid)
+                                                                     #<-- for shifted comparions
                     global_patches = rearrange(full_shift,   'b (t n) d -> b t n d', t=ctx_enc.t_grid)[:, j]#<-- for shifted comparions
                     aligned_global_patches = rearrange(full,   'b (t n) d -> (b t) n d', t=ctx_enc.t_grid)  #<-- for aligned comparisons
 
-                    B, M, D = local_patches.shape
-                    N = global_patches.shape[1]
-
                     # Unaligned comparisons for non-dynamics
-                    p1 = F.softmax(pool(local_patches)[0] / cfg.ts, dim=-1)  
                     with torch.no_grad(): p2 = centering(tgt_pool(global_patches)[0], tt_schedule[epoch]).detach()
-                    loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
+                    if not cfg.ctr_ctxonly:
+                        p1 = F.softmax(pool(local_patches)[0] / cfg.ts, dim=-1)  
+                        loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
+                    else:
+                        loss = 0
+                    if cfg.ctr_full:
+                        p1_ctx = F.softmax(pool(local_ctx_patches)[0] / cfg.ts, dim=-1)  
+                        loss +=-(p2 * (p1_ctx + 1e-8).log()).sum(dim=-1).mean()
+                   
                     if cfg.ctr_distill:
                         # p1_ctr = F.softmax(pool_ctr(local_patches)[0]/ cfg.ts, dim=-1)  
                         # Unaligned contrastive distillation for dynamics <-- create difficulty for ctr loss
                         # loss += (p2 * (p1_ctr + 1e-8).log()).sum(dim=-1).mean()
                         # Aligned contrasive distillation for dynamics
-                        p1_ctr_align = F.softmax(pool_ctr(aligned_local_paches)[0]/ cfg.ts, dim=-1)  
-                        with torch.no_grad(): aligned_p2 = centering(tgt_pool(aligned_global_patches)[0], tt_schedule[epoch]).detach()
-                        ctr_loss = (aligned_p2 * (p1_ctr_align + 1e-8).log()).sum(dim=-1).mean()
+                        
+                        # ctr_invertv1: against the teacher who capture dynamics
+                        # with torch.no_grad(): aligned_p2 = centering(tgt_pool(aligned_global_patches)[0], tt_schedule[epoch]).detach()
+                        # if not cfg.ctr_ctxonly:
+                        #     p1_ctr_align = F.softmax(pool_ctr(aligned_local_patches)[0]/ cfg.ts, dim=-1) if not cfg.ctr_invert else F.softmax(pool(aligned_local_patches, invert=True)[0]/ cfg.ts, dim=-1)
+                        #     ctr_loss = (aligned_p2 * (p1_ctr_align + 1e-8).log()).sum(dim=-1).mean()
+                        # else:
+                        #     ctr_loss = 0
+                        # if cfg.ctr_full:
+                        #     p1_ctr_ctx_align = F.softmax(pool_ctr(aligned_local_ctx_patches)[0]/ cfg.ts, dim=-1) if not cfg.ctr_invert else F.softmax(pool(aligned_local_ctx_patches, invert=True)[0]/ cfg.ts, dim=-1)
+                        #     ctr_loss += (aligned_p2 * (p1_ctr_ctx_align + 1e-8).log()).sum(dim=-1).mean()
+                        
+                        # ctr_invertv2: get close to the invert of teacher's output
+                        with torch.no_grad(): 
+                            aligned_p2 = centering(tgt_pool(aligned_global_patches)[0], tt_schedule[epoch]).detach()
+                            if cfg.ctr_invert:
+                                aligned_p2_invert = centering(tgt_pool(aligned_global_patches, invert=True)[0], tt_schedule[epoch]).detach()
+                        if not cfg.ctr_ctxonly:
+                            p1_ctr_align = F.softmax(pool_ctr(aligned_local_patches)[0]/ cfg.ts, dim=-1) 
+                            ctr_loss = (aligned_p2 * (p1_ctr_align + 1e-8).log()).sum(dim=-1).mean() if not cfg.ctr_invert else -(aligned_p2_invert * (p1_ctr_align + 1e-8).log()).sum(dim=-1).mean()
+                        else:
+                            ctr_loss = 0
+                        if cfg.ctr_full:
+                            p1_ctr_ctx_align = F.softmax(pool_ctr(aligned_local_ctx_patches)[0]/ cfg.ts, dim=-1) 
+                            ctr_loss += (aligned_p2 * (p1_ctr_ctx_align + 1e-8).log()).sum(dim=-1).mean() if not cfg.ctr_invert else -(aligned_p2_invert * (p1_ctr_ctx_align + 1e-8).log()).sum(dim=-1).mean()
+                        
                         per['ctr_distill'] = ctr_loss
                     per['ctr'] = loss
 
@@ -488,8 +556,9 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
             ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m)
-            logits_to_update = p2 if not cfg.ctr_distill else torch.cat([p2, aligned_p2], dim=0)
-            centering.update_center(logits_to_update)
+            if 'ctr' in cfg.suffix:
+                logits_to_update = p2 if not cfg.ctr_distill else torch.cat([p2, aligned_p2], dim=0)
+                centering.update_center(logits_to_update)
             for k, v in per.items(): losses[k].append(v.item())
             
             if step % 25 == 0:
@@ -536,12 +605,43 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
             logger.log({"visual": wandb.Image(visuals), "epoch": epoch, "step": step})
         
     return tgt_enc, losses
+def train_ac(encoder, loader, epochs, device, lr=3e-4, wd=0.05, rollout_k=2, rollout_w=1.0, action_dim=7):
+    print("=== Phase 2: D-JEPA ===")
+    T, S = encoder.t_grid, encoder.s_grid ** 2
+    pi_encoder = copy.deepcopy(encoder) # trainable encoder for a policy
+    encoder.eval()
+    for p in encoder.parameters(): p.requires_grad_(False)
+    ac = ACPredictor(s_grid=encoder.s_grid, action_dim=action_dim).to(device); pi_head = MLP(S*encoder.dim, 1024, action_dim).to(device)
+    opt = torch.optim.AdamW(param_groups([pi_encoder, pi_head, ac], wd), lr=lr)
+    losses = {"tf": [], "roll": [], "a=0": []}; step = 0
+    for epoch in range(epochs):
+        pbar = tqdm(loader)
+        for videos in pbar:
+            videos = videos.to(device); B = videos.size(0)
+            with torch.no_grad(): z = encoder(videos).view(B, T, S, -1)
+            enc_segs =  pi_encoder(rearrange(videos, 'B C (T S) H W -> (B T) C S H W', T = T)) 
+            actions = rearrange(pi_head(rearrange(enc_segs, 'BT tokens d -> BT (tokens d)')), '(B T) d -> B T d', B = B)
+            trans_actions = actions[:, :-1]
+            preds = ac(z[:, :-1], trans_actions)
+            tgt = z[:, 1:]; loss_tf = (preds - tgt).abs().mean()
+            k = min(rollout_k, T - 1)
+            rolled = ac.rollout(z[:, 0], actions[:, :k])
+            # compare the kth predictted representation from (z_0, a_1, a_2, ... a_k) to z_k
+            loss_roll = (rolled[:, -1] - z[:, k]).abs().mean()
+            loss = loss_tf + rollout_w * loss_roll
+            opt.zero_grad(); loss.backward(); opt.step()
+            losses["tf"].append(loss_tf.item()); losses["roll"].append(loss_roll.item())
+            if step % 25 == 0:
+                pbar.set_postfix_str(f"ep={epoch} tf={loss_tf.item():.4f} roll={loss_roll.item():.4f}")
+            step += 1
+    return pi_encoder, pi_head, ac, losses
 
 class cfg:
     img_size = 96
     patch_size = 8 # 8 works for lifting, too blury for can.
     num_frames = 8
-    phase1_epochs= 50
+    phase1_epochs = 50
+    phase2_epochs = 0 # 30
     batch_size= 128 # 64
     episodes = 100
     ts = 0.1 # student temp 
@@ -551,33 +651,42 @@ class cfg:
     attn_reg = 0 # regularize entropy
     ctr_shift = True
     ctr_distill = True
+    ctr_full = True
+    ctr_ctxonly = False
+    ctr_invert = True
 
     # Logging 
     name='djepa' # or djepa
-    suffix = 'ctr'
-    suffix2 = 'short'
+    suffix = 'ctr_largebatch_invert'
+    suffix2 = 'short_shift'
     use_wandb = True
 
 def main(cfg,  device=None):
+    if 'vjepa' in cfg.name:
+        global MASK_GROUPS
+        MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7)]
+        cfg.suffix = cfg.suffix2 = ''; cfg.ctr_shift = False
+
     device = device or pick_device(); print(f"device: {device}")
     rng = random.Random(0)
     ds = RobomimicVideos(episodes=cfg.episodes, cfg= cfg, rng=rng, img_size=cfg.img_size, num_frames=cfg.num_frames, ctr_shift=cfg.ctr_shift)
     val_ds = RobomimicVideos(robots=['panda'], episodes=1, cfg= cfg, rng=random.Random(0), img_size=cfg.img_size, num_frames=cfg.num_frames)
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=8, prefetch_factor=4, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, drop_last=True)
-
+    config_dict = {k: v for k, v in cfg.__dict__.items() if not k.startswith("__")}
     logger = init_logger(
         cfg.use_wandb,
         project="djepa-playground",
         name=f"{cfg.name}-pretrain-{cfg.suffix}-{cfg.suffix2}",
-        config=vars(cfg)
+        config=config_dict
     )
-    if cfg.name == "vjepa2":
-        global MASK_GROUPS
-        MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7)]
     
     encoder, p1 = pretrain(cfg, loader, val_loader, rng, cfg.phase1_epochs, device, logger=logger)
+    if cfg.phase2_epochs > 0:
+        pi_encoder, pi_head, ac, p2 = train_ac(encoder, loader, cfg.phase2_epochs, device)
     return {"encoder": encoder, "loader": loader, "device": device, "losses": p1}
+
+
 if __name__ == "__main__": 
     cfg = cfg()
     main(cfg)
