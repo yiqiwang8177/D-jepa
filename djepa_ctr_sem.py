@@ -8,7 +8,7 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from sklearn.decomposition import PCA
 import torchvision.transforms as T
-
+from utils import random_drop_mask, random_spatial_mask
 
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
 ctr_gap = 1
@@ -352,43 +352,77 @@ class DINOCentering(nn.Module):
         centered_logits = teacher_logits - self.center
         return F.softmax(centered_logits / teacher_temp, dim=-1)
     
-class AttentionPooling(nn.Module):
-    # convert each token to a weight via MLP, and take the weighted average of the tokens as output.
-    # then, output a softmax distribution
-    def __init__(self, in_dim, hidden_dim = 512, out_dim = 256):
+class TransformerPooling(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        hidden_dim=512,
+        out_dim=256,
+        num_heads=8,
+    ):
         super().__init__()
-        # self.norm = nn.LayerNorm(in_dim, eps=1e-6)
-        self.scorer = nn.Linear(in_dim, 1)
-        # self.scorer = nn.Sequential(
-        #     nn.Linear(in_dim, hidden_dim // 4), # Dimension bottleneck
-        #     nn.Tanh(),                          # Bounds the activation range
-        #     nn.Linear(hidden_dim // 4, 1, bias=False)
-        # )
-        self.scale = hidden_dim ** -0.5 
-        self.out = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim))
 
-    def forward(self, tokens, masks=None, invert=False):
-        # tokens = self.norm(tokens)               # normalize we use the pooler.
-        
-        logits = self.scorer(tokens).squeeze(-1) #* self.scale  # (B, N)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, in_dim) * 0.02)
 
-        if invert:
-            # v1
-            # weights = F.softmax(logits, dim=-1)       # (B, N)
-            # weights = 1.0 - weights
-            # weights = weights / weights.sum(dim=-1, keepdim=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=in_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
 
-            # v2
-            logits = -logits
+        self.pooler = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=1,
+        )
 
+        self.out = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, tokens, masks=None):
+        """
+        Args:
+            tokens: (B, N, D)
+            masks:  (B, N), True = visible token
+
+        Returns:
+            logits: (B, out_dim)
+            cls_repr: (B, D)
+        """
+        B, N, D = tokens.shape
+
+        # prepend CLS token
+        cls_token = self.cls_token.expand(B, -1, -1)  # (B,1,D)
+        x = torch.cat([cls_token, tokens], dim=1)     # (B,N+1,D)
+
+        key_padding_mask = None
         if masks is not None:
-            if len(masks.shape) == 3:
-                masks = masks.squeeze(1) # B,1,N -> (B, N)
-            logits = logits.masked_fill(~masks, float('-inf'))
+            if masks.ndim == 3:
+                masks = masks.squeeze(1)
 
-        weights = F.softmax(logits, dim=-1)       # (B, N)
-        pooled = (tokens * weights.unsqueeze(-1)).sum(dim=1)
-        return self.out(pooled), weights
+            cls_mask = torch.ones(
+                B,
+                1,
+                dtype=masks.dtype,
+                device=masks.device,
+            )
+
+            masks = torch.cat([cls_mask, masks], dim=1)
+
+            # Transformer expects:
+            # True = ignore token
+            key_padding_mask = ~masks
+
+        x = self.pooler( x,  src_key_padding_mask=key_padding_mask,  )
+        cls_repr = x[:, 0]  # (B,D)
+        logits = self.out(cls_repr)
+
+        return logits, cls_repr
 
 class ACPredictor(nn.Module):
     """Block-causal action/state-conditioned predictor for next latent frame."""
@@ -460,17 +494,6 @@ def _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells):
             return masked, visible
     return best
 
-def random_drop_mask(B, S, p, device='cpu'):
-    """
-    Args:
-        B: batch size
-        S: sequence length (number of patches)
-        p: drop probability, e.g. 0.3 drops 30% of patches
-        device: torch device
-    Returns:
-        mask: (B, S) boolean tensor, True = keep, False = drop
-    """
-    return torch.rand(B, S, device=device) >= p
 
 def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5)):
     rng = rng or random
@@ -490,15 +513,13 @@ def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1
             pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
         else:
             ctx, pred = [], []
-            # randomly masked out all patches at frame i, and set patches not from frame i to be visible context.
-            # all patches from frame j = (i + ctr_gap) % t_grid to be prediction target. Learn arbitrary neighbor frames to be have similar background.
+            # randomly masked out all patches at frame i, and set all patches not from frame i to be visible context.
             for _ in range(B):
-                i = rng.randint(0, t_grid - 1); j = (i + ctr_gap) % t_grid
+                i = rng.randint(0, t_grid - 1) 
                 visible = [p for p in range(t_grid * s_grid * s_grid) if not (i * s_grid * s_grid <= p < (i + 1) * s_grid * s_grid)]
                 ctx.append(visible)
-                masked = list(range(j * s_grid * s_grid, (j + 1) * s_grid * s_grid))
+                masked = [p for p in range(t_grid * s_grid * s_grid) if (i * s_grid * s_grid <= p < (i + 1) * s_grid * s_grid)]
                 pred.append(masked)
-            
         groups.append({"label": label, "n_blocks": n_blocks, "block_hw": (h, w),
                        "ctx": ctx, "pred": pred})
     return groups
@@ -511,19 +532,17 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
     centering =  DINOCentering(256).to(device)  # for centering teacher output in contrastive distillation
     for p in tgt_enc.parameters(): p.requires_grad_(False)
     pred = JEPAPredictor(t_grid=ctx_enc.t_grid, s_grid=ctx_enc.s_grid).to(device)
-    pool = AttentionPooling(ctx_enc.dim).to(device); tgt_pool = copy.deepcopy(pool).to(device); pool_ctr = AttentionPooling(ctx_enc.dim).to(device)
+    pool = TransformerPooling(ctx_enc.dim).to(device); tgt_pool = copy.deepcopy(pool).to(device)
     for p in tgt_pool.parameters(): p.requires_grad_(False)
     print(f"tubelet grid: t={ctx_enc.t_grid} s={ctx_enc.s_grid} -> {ctx_enc.n_patches} patches")
     params_to_opt = [ctx_enc, pred]
     if cfg.name == 'djepa':
         params_to_opt += [pool]
-        if cfg.ctr_distill:
-            params_to_opt += [pool_ctr]
+
     opt = torch.optim.AdamW(param_groups(params_to_opt, wd), lr=lr)
     total = epochs * len(loader)
     losses = {g[0]: [] for g in MASK_GROUPS}; step = 0; D = ctx_enc.dim
-    if cfg.ctr_distill:
-        losses['ctr_distill'] = []
+
     tt_start, tt_end, tt_warm = cfg.tt_min, cfg.tt_max, cfg.tt_warm
     # create teacher temp schedule for each epochss that starts from tt_start, ends at tt_end, and warms up for tt_warm epochs.
     tt_schedule = [tt_start + (tt_end - tt_start) * min(1, epoch / tt_warm) for epoch in range(epochs)]
@@ -532,90 +551,40 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
         for videos in pbar:
             if cfg.augment:
                 videos = video_aug(videos)
-            if cfg.ctr_shift: # Bx(2xC)xTxHxW
-                videos, ctr_videos = torch.chunk(videos, 2, dim=1)
-                ctr_videos = ctr_videos.to(device, non_blocking=True)
                 
             videos = videos.to(device, non_blocking=True); B = videos.size(0)
             
             groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng)
             with torch.no_grad(): full = F.layer_norm(tgt_enc(videos), (D,))
             per = {}
+            if 'vjepa' not in cfg.name:
+                per['ctr'] = 0
             for g in groups:
-                assert False, f"Ctr mask is unclear, why we're masking i and predicting j?"
                 ci = torch.tensor(g["ctx"], device=device); pi = torch.tensor(g["pred"], device=device)
                 tgt = full.gather(1, pi.unsqueeze(-1).expand(-1, -1, D))
                 encoded_patches = ctx_enc(videos, ci) 
                 pred_patches = pred(encoded_patches, ci, pi)
-                # vjepa2 case
+                # Vjepa case
                 per[g["label"]] = (pred_patches - tgt).abs().mean()
-                if 'ctr' in cfg.suffix:
-                    if g["label"] == 'long' and cfg.suffix2 == 'short':
-                        continue
-                    
-                    if cfg.ctr_shift:
-                        with torch.no_grad(): full_shift = F.layer_norm(tgt_enc(ctr_videos), (D,))
-                    # local "crops" per timestep
-                    i = rng.randint(0, ctx_enc.t_grid - 1)
-                    j = sample_j(i, ctx_enc.t_grid, ctr_gap, rng)
-
-                    # (b, n, d) — single frame for each sample in batch
-                    if not cfg.ctr_ctxonly:
-                        local_patches  = rearrange(pred_patches, 'b (t m) d -> b t m d', t=ctx_enc.t_grid)
-                        aligned_local_patches = rearrange(local_patches, ' b t m d -> (b t) m d')                #<-- for aligned comparisons
-                        local_patches = local_patches[:, i]    
-                    if cfg.ctr_full:
-                        aligned_local_ctx_patches = rearrange(encoded_patches, 'b (t m) d -> b t m d', t=ctx_enc.t_grid)
-                        local_ctx_patches = aligned_local_ctx_patches[:, i]
-                        aligned_local_ctx_patches = rearrange(aligned_local_ctx_patches, 'b t m d -> (b t) m d', t=ctx_enc.t_grid)
-                                                                     #<-- for shifted comparions
-                    global_patches = rearrange(full_shift,   'b (t n) d -> b t n d', t=ctx_enc.t_grid)[:, j]#<-- for shifted comparions
-                    aligned_global_patches = rearrange(full,   'b (t n) d -> (b t) n d', t=ctx_enc.t_grid)  #<-- for aligned comparisons
-                    align_tgt_mask = random_drop_mask(aligned_global_patches.shape[0], aligned_global_patches.shape[1], p=cfg.ctr_tgt_drop, device = device) if cfg.ctr_tgt_drop > 0 else None
-                    tgt_mask = random_drop_mask(global_patches.shape[0], global_patches.shape[1], p=cfg.ctr_tgt_drop, device = device) if cfg.ctr_tgt_drop > 0 else None
-                   
-                    # Unaligned comparisons for non-dynamics
+                # Djepa case
+                if 'vjepa' not in cfg.name and g["label"] == 'ctr':
+                    local_patches = pred_patches # b (t m) d where t=1            
+                    global_patches = tgt # b (t m) d where t=1   
+                    st_mask = random_spatial_mask(B=B, h=6, w=6, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 25%=36/144 of patche
+                    tgt_mask = random_spatial_mask(B=B, h=10, w=10, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
+                    # Aligned comparisons for non-dynamics
                     with torch.no_grad(): p2 = centering(tgt_pool(global_patches, masks=tgt_mask)[0], tt_schedule[epoch]).detach()
-                    if not cfg.ctr_ctxonly:
-                        local_patches = F.layer_norm(local_patches, (D,))
-                        p1 = F.softmax(pool(local_patches)[0] / cfg.ts, dim=-1)  
-                        loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
-                    else:
-                        loss = 0
-                    if cfg.ctr_full:
-                        local_ctx_patches = F.layer_norm(local_ctx_patches, (D,))
-                        p1_ctx = F.softmax(pool(local_ctx_patches)[0] / cfg.ts, dim=-1)  
-                        loss +=-(p2 * (p1_ctx + 1e-8).log()).sum(dim=-1).mean()
-                   
-                    if cfg.ctr_distill:
-                        # ctr_invertv2: get close to the invert of teacher's output
-                        with torch.no_grad(): 
-                            aligned_p2 = centering(tgt_pool(aligned_global_patches, masks=align_tgt_mask)[0], tt_schedule[epoch]).detach()
-                            if cfg.ctr_invert:
-                                aligned_p2_invert = centering(tgt_pool(aligned_global_patches, masks=align_tgt_mask, invert=True)[0], tt_schedule[epoch]).detach()
-                                
-                        if not cfg.ctr_ctxonly:
-                            aligned_local_patches = F.layer_norm(aligned_local_patches, (D,))
-                            # p1_ctr_align = F.softmax(pool_ctr(aligned_local_patches)[0]/ cfg.ts, dim=-1) 
-                            p1_ctr_align = F.softmax(pool(aligned_local_patches, invert=True)[0]/ cfg.ts, dim=-1) 
-                            ctr_loss = (aligned_p2 * (p1_ctr_align + 1e-8).log()).sum(dim=-1).mean() if not cfg.ctr_invert else -(aligned_p2_invert * (p1_ctr_align + 1e-8).log()).sum(dim=-1).mean()
-                        else:
-                            ctr_loss = 0
-                        if cfg.ctr_full:
-                            aligned_local_ctx_patches =  F.layer_norm(aligned_local_ctx_patches, (D,))
-                            # p1_ctr_ctx_align = F.softmax(pool_ctr(aligned_local_ctx_patches)[0]/ cfg.ts, dim=-1) 
-                            p1_ctr_ctx_align = F.softmax(pool(aligned_local_ctx_patches, invert=True)[0]/ cfg.ts, dim=-1) 
-                            ctr_loss += (aligned_p2 * (p1_ctr_ctx_align + 1e-8).log()).sum(dim=-1).mean() if not cfg.ctr_invert else -(aligned_p2_invert * (p1_ctr_ctx_align + 1e-8).log()).sum(dim=-1).mean()
-                        
-                        per['ctr_distill'] = ctr_loss
-                    per['ctr'] = loss
+
+                    p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
+                    loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
+                    per[g["label"]] += loss # replace/add to the prediction loss
 
             loss = sum(per.values()) / len(per)
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
             ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m)
             if 'ctr' in cfg.suffix:
-                logits_to_update = p2 if not cfg.ctr_distill else torch.cat([p2, aligned_p2], dim=0)
+                logits_to_update = p2 # if not cfg.ctr_distill else torch.cat([p2, aligned_p2], dim=0)
                 centering.update_center(logits_to_update)
             for k, v in per.items(): losses[k].append(v.item())
             
@@ -646,15 +615,11 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                             frame = videos[0, :, frame_idx].permute(1, 2, 0).cpu()+ 0.5  
                             frame = (frame.clamp(0, 1).numpy() * 255).astype(np.uint8)
                             frame_tokens = tokens[:1, token_slice] # take the first sample
-                            attn_map = tgt_pool(frame_tokens)[1].reshape(ctx_enc.s_grid, ctx_enc.s_grid).cpu().numpy()
+                            # attn_map = tgt_pool(frame_tokens)[1].reshape(ctx_enc.s_grid, ctx_enc.s_grid).cpu().numpy()
                             pca_frame = visualize_tokens_pca( frame_tokens, h=ctx_enc.s_grid, w=ctx_enc.s_grid,).resize((cfg.img_size, cfg.img_size))
-                            attn_visual = visualize_attnmap( attn_map, size=(cfg.img_size, cfg.img_size), )
-                            to_add = [  frame, np.array(pca_frame),np.array(attn_visual),]
-                            # add contrastive visualizuations:
-                            if cfg.ctr_distill:
-                                # ctr_attn_visual = visualize_attnmap(pool_ctr(frame_tokens)[1].reshape(ctx_enc.s_grid, ctx_enc.s_grid).cpu().numpy(), size=(cfg.img_size, cfg.img_size), )
-                                ctr_attn_visual = visualize_attnmap(tgt_pool(frame_tokens, invert=True)[1].reshape(ctx_enc.s_grid, ctx_enc.s_grid).cpu().numpy(), size=(cfg.img_size, cfg.img_size), )
-                                to_add += [np.array(ctr_attn_visual),]
+                            # attn_visual = visualize_attnmap( attn_map, size=(cfg.img_size, cfg.img_size), )
+                            to_add = [  frame, np.array(pca_frame),] # np.array(attn_visual),]
+                            
                             visuals.append(np.concatenate( to_add, axis=1,) )
 
             visuals = np.array(visuals)
@@ -666,36 +631,6 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
         
             torch.save( {'epoch':epoch, 'encoder': tgt_enc.state_dict()}, encoder_path)
     return tgt_enc, losses
-def train_ac(encoder, loader, epochs, device, lr=3e-4, wd=0.05, action_dim=7, logger=None):
-    print("=== Phase 2: D-JEPA ===")
-    T, S = encoder.t_grid, encoder.s_grid ** 2
-    pi_encoder = copy.deepcopy(encoder) # trainable encoder for a policy
-    encoder.eval()
-    for p in encoder.parameters(): p.requires_grad_(False)
-    ac = ACPredictor(s_grid=encoder.s_grid, action_dim=T*action_dim).to(device); pi_head = MLP(S*encoder.dim, 1024, T*action_dim).to(device)
-    opt = torch.optim.AdamW(param_groups([pi_encoder, pi_head, ac], wd), lr=lr)
-    losses = {"tf": [],  "a=0": []}; step = 0
-    for epoch in range(epochs):
-        pbar = tqdm(loader)
-        for videos in pbar:
-            videos = videos.to(device); B = videos.size(0)
-            with torch.no_grad(): z = encoder(videos).view(B, T, S, -1)
-            enc_segs =  pi_encoder(rearrange(videos, 'B C (T S) H W -> (B T) C S H W', T = T)) 
-            actions = rearrange(pi_head(rearrange(enc_segs, 'BT tokens d -> BT (tokens d)')), '(B T) d -> B T d', B = B)
-
-            # take the first encoded observation, generate a chunk of "actions", and predicts the last encoded observation
-            preds = ac(z[:, :1], actions[:, :1])
-            tgt = z[:, -1:]; loss_tf = (preds - tgt).abs().mean()
-            
-            loss = loss_tf 
-            opt.zero_grad(); loss.backward(); opt.step()
-            losses["tf"].append(loss_tf.item())
-            if step % 25 == 0:
-                pbar.set_postfix_str(f"ep={epoch} tf={loss_tf.item():.4f}")
-                if logger:
-                    logger.log({"phase2_epoch": epoch,  f"phase2_ac_loss": loss_tf.item() })
-            step += 1
-    return pi_encoder, pi_head, ac, losses
 
 class cfg:
     img_size = 96
@@ -703,26 +638,27 @@ class cfg:
     num_frames = 8
     phase1_epochs = 50
     phase2_epochs = 0 # 3 # 30
-    batch_size= 128 # 64
+    batch_size= 128 # 128 # 64
     episodes = 100
     ts = 0.1 # student temp 
     tt_min = 0.04 # teacher temp start
     tt_max = 0.07 # teacher temp end
     tt_warm = 3 # epochs
     attn_reg = 0 # regularize entropy
-    ctr_shift = True
-    ctr_distill = True
-    ctr_full = True
+    ctr_shift = False
+    ctr_distill = False
+    ctr_full = False
     ctr_ctxonly = False
-    ctr_invert = True
+    ctr_invert = False
+    ctr_drop = 0.7
     ctr_tgt_drop = 0.3 # drop teacher patches by x%
-    augment = True 
+    augment = False
 
     # Logging 
     save_dir = './log'
     name='djepa' # or djepa
-    suffix = 'ctr_largebatch_tgtdrop_fullinvert'
-    suffix2 = 'short_shift2_videoaug'
+    suffix = 'ctr'
+    suffix2 = 'sem_pr_st.25_tgt.7'
     use_wandb = True
     
 def main(cfg,  device=None):
@@ -747,21 +683,9 @@ def main(cfg,  device=None):
     ); save_dir = os.path.join(cfg.save_dir, exp_name)
     os.makedirs(save_dir, exist_ok=True)
     encoder_path = os.path.join(save_dir, 'encoder.pth'); pi_ac_path = os.path.join(save_dir, 'pi_ac.pth')
-    if not os.path.exists(encoder_path):
-        encoder, p1 = pretrain(cfg, loader, val_loader, rng, cfg.phase1_epochs, device, logger=logger, encoder_path=encoder_path)
-        torch.save( {'epoch': cfg.phase1_epochs, 'encoder': encoder.state_dict() }, encoder_path)
-    else:
-        encoder = VideoEncoder(num_frames=cfg.num_frames, img_size=cfg.img_size, patch_size=cfg.patch_size).to(device)
-        encoder.load_state_dict(torch.load(encoder_path, )['encoder'])
-   
-    if cfg.phase2_epochs > 0:
-        pi_encoder, pi_head, ac, p2 = train_ac(encoder, loader, cfg.phase2_epochs, device, logger=logger)
-        pi_ac_dict = {
-            'epoch': cfg.phase2_epochs,
-            'pi_encoder': pi_encoder.state_dict(),
-            'pi_head': pi_head.state_dict(),
-            'ac': ac.state_dict() }
-        torch.save( pi_ac_dict , pi_ac_path)
+    encoder, p1 = pretrain(cfg, loader, val_loader, rng, cfg.phase1_epochs, device, logger=logger, encoder_path=encoder_path)
+        # torch.save( {'epoch': cfg.phase1_epochs, 'encoder': encoder.state_dict() }, encoder_path)
+    
     return {"encoder": encoder, "loader": loader, "device": device}
 
 
