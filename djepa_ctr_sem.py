@@ -11,10 +11,7 @@ import torchvision.transforms as T
 from utils import random_drop_mask, random_spatial_mask
 
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
-ctr_gap = 1
-ctr_distills = 0
-ctr_drop = (0.70, 0.85) # (0.3, 0.3) # (0.15, 0.85) # could drop 15% to 85% of patches
-ctr_drop_small = (0, 0) # no drops (0.15, 0.3) 
+
 
 def visualize_attnmap(map, size=(96, 96)):
     # map: (s_grid, s_grid)
@@ -558,26 +555,42 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
             with torch.no_grad(): full = F.layer_norm(tgt_enc(videos), (D,))
             per = {}
             if 'vjepa' not in cfg.name:
-                per['ctr'] = 0
+                ctr_loss = torch.tensor(0).to(device).float() # accumulate across groups (different masks)
             for g in groups:
                 ci = torch.tensor(g["ctx"], device=device); pi = torch.tensor(g["pred"], device=device)
                 tgt = full.gather(1, pi.unsqueeze(-1).expand(-1, -1, D))
                 encoded_patches = ctx_enc(videos, ci) 
                 pred_patches = pred(encoded_patches, ci, pi)
                 # Vjepa case
-                per[g["label"]] = (pred_patches - tgt).abs().mean()
+                # no prediction loss for ctr frame mask
+                per[g["label"]] = (pred_patches - tgt).abs().mean() if g["label"] != 'ctr' else 0
+                print(g["label"], tgt.shape)
                 # Djepa case
                 if 'vjepa' not in cfg.name and g["label"] == 'ctr':
-                    local_patches = pred_patches # b (t m) d where t=1            
-                    global_patches = tgt # b (t m) d where t=1   
-                    st_mask = random_spatial_mask(B=B, h=6, w=6, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 25%=36/144 of patche
-                    tgt_mask = random_spatial_mask(B=B, h=10, w=10, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
-                    # Aligned comparisons for non-dynamics
-                    with torch.no_grad(): p2 = centering(tgt_pool(global_patches, masks=tgt_mask)[0], tt_schedule[epoch]).detach()
-
-                    p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
-                    loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
-                    per[g["label"]] += loss # replace/add to the prediction loss
+                    for i in range(cfg.sem_distill):
+                        local_patches = pred_patches # b (t m) d where t=1
+                        
+                        if g["label"] == 'ctr':  # frame-to-frame comparisons, no time axis         
+                            global_patches = tgt; tgt_h, tgt_w = 8, 8 # 10,10
+                            if i == 0 or i < cfg.sem_distill -1:
+                                st_h, st_w = 4, 4
+                            else:
+                                st_h, st_w = tgt_h, tgt_w
+                            st_mask = random_spatial_mask(B=B, h=st_h, w=st_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 25%=36/144 of patches
+                            tgt_mask = random_spatial_mask(B=B, h=tgt_h, w=tgt_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
+                        else: # combine time axis with batch to achieve frame-to-frame comparisons
+                            global_patches = rearrange(full, 'B (T N) d -> (B T) N d', T=ctx_enc.t_grid)
+                            local_patches = rearrange(local_patches, 'B (T M) d -> (B T) M d', T=ctx_enc.t_grid)
+                            st_mask = None
+                            tgt_mask = random_spatial_mask(B=B*ctx_enc.t_grid, h=10, w=10, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
+                        # Aligned comparisons for non-dynamics
+                        with torch.no_grad(): p2 = centering(tgt_pool(global_patches, masks=tgt_mask)[0], tt_schedule[epoch]).detach()
+                        # print(g["label"], local_patches.shape, global_patches.shape, tgt_mask.shape)
+                        p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
+                        loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
+                        ctr_loss += loss # accumulate to the ctr loss
+               
+            per['ctr'] = ctr_loss
 
             loss = sum(per.values()) / len(per)
             opt.zero_grad(); loss.backward(); opt.step()
@@ -627,9 +640,7 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
             h, w = visuals.shape[1], visuals.shape[2]
             visuals = visuals.reshape(-1, w, 3)
             logger.log({"visual": wandb.Image(visuals), "epoch": epoch, "step": step})
-        if not os.path.exists(encoder_path):
-        
-            torch.save( {'epoch':epoch, 'encoder': tgt_enc.state_dict()}, encoder_path)
+        torch.save( {'epoch':epoch, 'encoder': tgt_enc.state_dict()}, encoder_path)
     return tgt_enc, losses
 
 class cfg:
@@ -652,13 +663,16 @@ class cfg:
     ctr_invert = False
     ctr_drop = 0.7
     ctr_tgt_drop = 0.3 # drop teacher patches by x%
+
+    # semantic consistency
+    sem_distill = 4
     augment = False
 
     # Logging 
     save_dir = './log'
     name='djepa' # or djepa
     suffix = 'ctr'
-    suffix2 = 'sem_pr_st.25_tgt.7'
+    suffix2 = 'sem4_st4_tgt8'
     use_wandb = True
     
 def main(cfg,  device=None):

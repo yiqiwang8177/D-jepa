@@ -18,6 +18,7 @@ scripts/
 __pycache__
 wandb/
 log/
+output/
 
 # OMC scratch
 .omc/
