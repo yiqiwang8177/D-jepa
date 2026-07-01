@@ -510,13 +510,18 @@ def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1
             pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
         else:
             ctx, pred = [], []
-            # randomly masked out all patches at frame i, and set all patches not from frame i to be visible context.
-            for _ in range(B):
-                i = rng.randint(0, t_grid - 1) 
-                visible = [p for p in range(t_grid * s_grid * s_grid) if not (i * s_grid * s_grid <= p < (i + 1) * s_grid * s_grid)]
-                ctx.append(visible)
-                masked = [p for p in range(t_grid * s_grid * s_grid) if (i * s_grid * s_grid <= p < (i + 1) * s_grid * s_grid)]
-                pred.append(masked)
+            # randomly create spatial mask across time.
+            # sample h,w 
+            h, w = rng.randint(4, 8), rng.randint(4, 8)
+            # Bx(H*W)
+            visible_masks = random_spatial_mask(B=B, h=h, w=w, H=s_grid, W=s_grid, device='cpu').numpy()
+            # print('Debugging ctr mask:', h, w, visible_masks[0].sum(), visible_masks.shape)
+            visible = [np.where(m)[0].tolist() for m in visible_masks]
+            masked = [np.where(~m)[0].tolist() for m in visible_masks]
+            # expand to tubes
+            pred = [_expand_tubes(sorted(v), t_grid, s_grid) for v in visible]
+            ctx = [_expand_tubes(sorted(m), t_grid, s_grid) for m in masked]
+
         groups.append({"label": label, "n_blocks": n_blocks, "block_hw": (h, w),
                        "ctx": ctx, "pred": pred})
     return groups
@@ -568,24 +573,15 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                 # Djepa case
                 if 'vjepa' not in cfg.name and g["label"] == 'ctr':
                     for i in range(cfg.sem_distill):
-                        local_patches = pred_patches # b (t m) d where t=1
-                        
-                        if g["label"] == 'ctr':  # frame-to-frame comparisons, no time axis         
-                            global_patches = tgt; tgt_h, tgt_w = cfg.tgt_crop, cfg.tgt_crop # 10,10
-                            if i == 0 or i < cfg.sem_distill -1:
-                                st_h, st_w = cfg.st_crop, cfg.st_crop
-                            else:
-                                st_h, st_w = tgt_h, tgt_w
-                            st_mask = random_spatial_mask(B=B, h=st_h, w=st_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 25%=36/144 of patches
-                            tgt_mask = random_spatial_mask(B=B, h=tgt_h, w=tgt_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
-                        else: # combine time axis with batch to achieve frame-to-frame comparisons
-                            global_patches = rearrange(full, 'B (T N) d -> (B T) N d', T=ctx_enc.t_grid)
-                            local_patches = rearrange(local_patches, 'B (T M) d -> (B T) M d', T=ctx_enc.t_grid)
-                            st_mask = None
-                            tgt_mask = random_spatial_mask(B=B*ctx_enc.t_grid, h=10, w=10, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
+                        local_patches = rearrange( pred_patches, 'B (T S) D -> (B T) S D', T=ctx_enc.t_grid)
+                        global_patches = rearrange(full, 'B (T S) D -> (B T) S D', T=ctx_enc.t_grid)
+                        tgt_h, tgt_w = rng.randint(9, ctx_enc.s_grid), rng.randint(9, ctx_enc.s_grid) # random crop size for teacher
+                        st_mask = None
+                        tgt_mask = random_spatial_mask(B=len(global_patches), h=tgt_h, w=tgt_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
+                      
                         # Aligned comparisons for non-dynamics
                         with torch.no_grad(): p2 = centering(tgt_pool(global_patches, masks=tgt_mask)[0], tt_schedule[epoch]).detach()
-                        # print(g["label"], local_patches.shape, global_patches.shape, tgt_mask.shape)
+                       
                         p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
                         loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
                         ctr_loss += loss # accumulate to the ctr loss
@@ -673,8 +669,8 @@ class cfg:
     save_dir = './log'
     name='djepa' # or djepa
     suffix = 'ctr'
-    suffix2 = 'sem_st6_tgt10'
-    use_wandb = False
+    suffix2 = 'semt_st4/8_tgt9/12'
+    use_wandb = True
     
 def main(cfg,  device=None):
     if 'vjepa' in cfg.name:
