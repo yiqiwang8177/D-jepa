@@ -1,11 +1,10 @@
 """Minimal V-JEPA 2.1: dense predictive loss, deep self-supervision, image/video co-training."""
-import copy, math, random
+import os, copy, math, random, wandb, numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision.datasets import MNIST, MovingMNIST
+from djepa_ctr_sem import RobomimicVideos, init_logger, visualize_tokens_pca
 
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7)]
-
 
 def sincos_1d(n, dim):
     pos = torch.arange(n).unsqueeze(1).float()
@@ -14,7 +13,6 @@ def sincos_1d(n, dim):
     pe[:, 0::2] = torch.sin(pos * div)
     pe[:, 1::2] = torch.cos(pos * div)
     return pe
-
 
 def sincos_2d(h, w, dim):
     assert dim % 4 == 0
@@ -82,37 +80,6 @@ def pick_device():
     return "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-class MovingMNISTVideos(Dataset):
-    def __init__(self, root="./data", num_frames=10):
-        self.base = MovingMNIST(root=root, download=True)
-        self.n = num_frames
-
-    def __len__(self):
-        return len(self.base)
-
-    def __getitem__(self, i):
-        v = self.base[i]
-        if isinstance(v, (tuple, list)):
-            v = v[0]
-        v = v.float() / 255.0
-        step = max(1, v.size(0) // self.n)
-        v = v[::step][: self.n]
-        return v.permute(1, 0, 2, 3).contiguous() - 0.5
-
-
-class MNISTImages(Dataset):
-    def __init__(self, root="./data", img_size=64):
-        mnist = MNIST(root=root, train=True, download=True)
-        imgs = mnist.data.float().div_(255.0).unsqueeze(1)
-        self.imgs = F.interpolate(imgs, size=(img_size, img_size), mode="bilinear", align_corners=False)
-
-    def __len__(self):
-        return len(self.imgs)
-
-    def __getitem__(self, i):
-        return self.imgs[i].unsqueeze(1) - 0.5
-
-
 class MultiModeEncoder(nn.Module):
     def __init__(
         self,
@@ -120,7 +87,7 @@ class MultiModeEncoder(nn.Module):
         t_patch=2,
         img_size=64,
         patch_size=8,
-        in_chans=1,
+        in_chans=3,
         dim=96,
         depth=8,
         heads=4,
@@ -299,6 +266,7 @@ def _step_loss(frames, mode, ctx_enc, tgt_enc, predictor, rng, lambda_ctx, weigh
     t_grid = 1 if mode == "image" else ctx_enc.t_grid_vid
     groups = sample_vjepa_masks(frames.size(0), t_grid, ctx_enc.s_grid, rng=rng, min_ctx=4 if mode == "image" else 8)
     with torch.no_grad():
+       
         full = tgt_enc(frames, return_hier=True)
     pred_losses, ctx_losses = {}, {}
     for g in groups:
@@ -315,11 +283,42 @@ def _step_loss(frames, mode, ctx_enc, tgt_enc, predictor, rng, lambda_ctx, weigh
     loss_ctx = sum(ctx_losses.values()) / len(ctx_losses)
     return loss_pred + lambda_ctx * loss_ctx, loss_pred, loss_ctx
 
+class cfg:
+    img_size = 96
+    patch_size = 8 # 8 works for robomimic
+    num_frames = 8
+    phase1_epochs = 50
+    phase2_epochs = 0 # 3 # 30
+    batch_size= 128 # 128 # 64
+    episodes = 100
+    ts = 0.1 # student temp 
+    tt_min = 0.04 # teacher temp start
+    tt_max = 0.07 # teacher temp end
+    tt_warm = 3 # epochs
+    attn_reg = 0 # regularize entropy
+    ctr_shift = False
+    ctr_distill = False
+    ctr_full = False
+    ctr_ctxonly = False
+    ctr_invert = False
+    ctr_drop = 0.7
+    ctr_tgt_drop = 0.3 # drop teacher patches by x%
+    st_crop = 4 # 6x6
+    tgt_crop = 9 # 10x10
+    # semantic consistency
+    sem_distill = 1
+    augment = False
+
+    # Logging 
+    save_dir = './log'
+    name='vjepa2.1' # or djepa
+    suffix = ''
+    suffix2 = ''
+    use_wandb = True
 
 def train(
-    epochs=4,
-    batch_size=24,
-    img_batch_size=64,
+    cfg,
+    
     lr=3e-4,
     wd=0.05,
     lambda_ctx=0.5,
@@ -328,13 +327,23 @@ def train(
     weight_distance=True,
     device=None,
 ):
-    device = device or pick_device()
+    rng = random.Random(0); device = device or pick_device()
     print(f"device: {device}")
-    video_ds = MovingMNISTVideos(num_frames=10)
-    image_ds = MNISTImages(img_size=64)
-    video_loader = DataLoader(video_ds, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
-    image_loader = DataLoader(image_ds, batch_size=img_batch_size, shuffle=True, num_workers=2, drop_last=True)
-    ctx_enc = MultiModeEncoder().to(device)
+    ds = RobomimicVideos(episodes=cfg.episodes, cfg= cfg, rng=rng, img_size=cfg.img_size, num_frames=cfg.num_frames, ctr_shift=cfg.ctr_shift)
+    val_ds = RobomimicVideos(robots=['panda'], episodes=1, cfg= cfg, rng=random.Random(0), img_size=cfg.img_size, num_frames=cfg.num_frames)
+    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=8, prefetch_factor=4, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, drop_last=True)
+    config_dict = {k: v for k, v in cfg.__dict__.items() if not k.startswith("__")}
+    exp_name = f"{cfg.name}-pretrain-{cfg.suffix}-{cfg.suffix2}"
+    logger = init_logger(
+        cfg.use_wandb,
+        project="djepa-playground",
+        name=exp_name,
+        config=config_dict
+    ); save_dir = os.path.join(cfg.save_dir, exp_name)
+    os.makedirs(save_dir, exist_ok=True)
+    encoder_path = os.path.join(save_dir, 'encoder.pth')
+    ctx_enc = MultiModeEncoder(num_frames=cfg.num_frames,  img_size=cfg.img_size, patch_size=cfg.patch_size).to(device)
     tgt_enc = copy.deepcopy(ctx_enc).to(device)
     for p in tgt_enc.parameters():
         p.requires_grad_(False)
@@ -344,9 +353,8 @@ def train(
         f"image grid: t={ctx_enc.t_grid_img} s={ctx_enc.s_grid} -> {ctx_enc.n_patches_img} tokens"
     )
     opt = torch.optim.AdamW(param_groups([ctx_enc, predictor], wd), lr=lr)
-    steps_per_epoch = min(len(video_loader), len(image_loader)) * 2
-    total = epochs * steps_per_epoch
-    rng = random.Random(0)
+    total = cfg.phase1_epochs * len(loader)
+    
     losses = {
         "video_pred": [],
         "video_ctx": [],
@@ -357,45 +365,74 @@ def train(
         "total": [],
     }
     step = 0
-    for epoch in range(epochs):
-        for videos, images in zip(video_loader, image_loader):
-            for mode, frames in (("video", videos), ("image", images)):
-                frames = frames.to(device)
-                loss, lp, lc = _step_loss(
-                    frames,
-                    mode,
-                    ctx_enc,
-                    tgt_enc,
-                    predictor,
-                    rng,
-                    lambda_ctx,
-                    weight_distance,
+    for epoch in range(cfg.phase1_epochs):
+        for videos in loader:
+            mode = "video"; frames = videos.to(device)
+            loss, lp, lc = _step_loss(
+                frames,
+                mode,
+                ctx_enc,
+                tgt_enc,
+                predictor,
+                rng,
+                lambda_ctx,
+                weight_distance,
+            )
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
+            ema_update(tgt_enc, ctx_enc, m)
+            losses[f"{mode}_pred"].append(lp.item())
+            losses[f"{mode}_ctx"].append(lc.item())
+            losses[f"{mode}_total"].append(loss.item())
+            losses["total"].append(loss.item())
+            if step % 25 == 0:
+                print(
+                    f"ep={epoch} step={step:5d} mode={mode:5s} pred={lp.item():.4f} "
+                    f"ctx={lc.item():.4f} total={loss.item():.4f} ema={m:.4f}"
                 )
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
-                ema_update(tgt_enc, ctx_enc, m)
-                losses[f"{mode}_pred"].append(lp.item())
-                losses[f"{mode}_ctx"].append(lc.item())
-                losses[f"{mode}_total"].append(loss.item())
-                losses["total"].append(loss.item())
-                if step % 25 == 0:
-                    print(
-                        f"ep={epoch} step={step:5d} mode={mode:5s} pred={lp.item():.4f} "
-                        f"ctx={lc.item():.4f} total={loss.item():.4f} ema={m:.4f}"
-                    )
-                step += 1
+                logger.log({"epoch": epoch, "step": step, "ema": m,  **{f"{mode}_{name}": v.item() for name, v in zip(['pred,' 'ctx', 'total'], [lp, lc, loss])}})
+            step += 1
+        
+        if cfg.use_wandb:
+            visuals, visual_interval = [], cfg.num_frames * 2
+            for i, (videos) in enumerate(val_loader):
+                if i % visual_interval == 0:
+                    videos = videos.to(device)
+                    with torch.no_grad():
+                        tokens = tgt_enc(videos) # use the teacher instead of the student
+
+                        frame_specs = [
+                            (0, slice(0, ctx_enc.s_grid * ctx_enc.s_grid)),      # first frame
+                            (-1, slice(-ctx_enc.s_grid * ctx_enc.s_grid, None)), # last frame
+                        ]
+
+                        for frame_idx, token_slice in frame_specs:
+
+                            frame = videos[0, :, frame_idx].permute(1, 2, 0).cpu()+ 0.5  
+                            frame = (frame.clamp(0, 1).numpy() * 255).astype(np.uint8)
+                            frame_tokens = tokens[:1, token_slice] # take the first sample
+                            pca_frame = visualize_tokens_pca( frame_tokens, h=ctx_enc.s_grid, w=ctx_enc.s_grid,).resize((cfg.img_size, cfg.img_size))
+                            to_add = [  frame, np.array(pca_frame),] # np.array(attn_visual),]
+                            
+                            visuals.append(np.concatenate( to_add, axis=1,) )
+
+            visuals = np.array(visuals)
+            # N x H x W x C -> (N*H) x W x C
+            h, w = visuals.shape[1], visuals.shape[2]
+            visuals = visuals.reshape(-1, w, 3)
+            logger.log({"visual": wandb.Image(visuals), "epoch": epoch, "step": step})
+
+        torch.save( {'epoch':epoch, 'encoder': tgt_enc.state_dict()}, encoder_path)
     return {
         "ctx_enc": ctx_enc,
         "tgt_enc": tgt_enc,
         "predictor": predictor,
         "losses": losses,
-        "video_loader": video_loader,
-        "image_loader": image_loader,
         "device": device,
     }
 
 
 if __name__ == "__main__":
-    train()
+    train(cfg())

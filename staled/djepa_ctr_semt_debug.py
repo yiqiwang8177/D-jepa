@@ -8,10 +8,10 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from sklearn.decomposition import PCA
 import torchvision.transforms as T
-from utils import random_drop_mask, random_spatial_mask
+from utils import random_drop_mask, random_spatial_mask, set_seed
+set_seed(42)
 
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
-
 
 def visualize_attnmap(map, size=(96, 96)):
     # map: (s_grid, s_grid)
@@ -84,7 +84,6 @@ def sincos_2d(h, w, dim):
     div = torch.exp(torch.arange(0, sub * 2, 2).float() * (-math.log(10000.) / (sub * 2)))
     return torch.cat([torch.sin(yy[:, None] * div), torch.cos(yy[:, None] * div),
                       torch.sin(xx[:, None] * div), torch.cos(xx[:, None] * div)], dim=-1)
-
 
 def sincos_3d(t, h, w, dim, t_frac=0.25):
     td = int(dim * t_frac); td += td % 2; sd = dim - td
@@ -491,7 +490,6 @@ def _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells):
             return masked, visible
     return best
 
-
 def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1.5)):
     rng = rng or random
     min_visible_cells = max(1, math.ceil(min_ctx / t_grid))
@@ -499,7 +497,7 @@ def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1
     for label, n_blocks, scale in MASK_GROUPS:
         h, w = _bsize(s_grid, scale, rng.uniform(*ar_range))
         ctx_spatial, pred_spatial = [], []
-        if label != "ctr":
+        if "ctr" not in label:
             for _ in range(B):
                 masked, visible = _sample_spatial_tubes(n_blocks, h, w, s_grid, rng, min_visible_cells)
                 ctx_spatial.append(sorted(visible)); pred_spatial.append(sorted(masked))
@@ -508,20 +506,29 @@ def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1
             
             ctx = [_expand_tubes(sorted(rng.sample(c, Lc)), t_grid, s_grid) for c in ctx_spatial]
             pred = [_expand_tubes(sorted(rng.sample(p, Lp)), t_grid, s_grid) for p in pred_spatial]
-        else:
+        elif "ctrt" == label:
+            # randomly create spatial mask across time
             ctx, pred = [], []
-            # randomly create spatial mask across time.
             # sample h,w 
-            h, w = rng.randint(4, 8), rng.randint(4, 8)
+            h, w = 4, 4 # rng.randint(4, 8), rng.randint(4, 8)
+            # h,w = get_random_h_w(rng, min_size=5, max_size=int(s_grid*s_grid*0.5)-1) # < 50% area
+
             # Bx(H*W)
             visible_masks = random_spatial_mask(B=B, h=h, w=w, H=s_grid, W=s_grid, device='cpu').numpy()
-            # print('Debugging ctr mask:', h, w, visible_masks[0].sum(), visible_masks.shape)
             visible = [np.where(m)[0].tolist() for m in visible_masks]
             masked = [np.where(~m)[0].tolist() for m in visible_masks]
             # expand to tubes
             pred = [_expand_tubes(sorted(v), t_grid, s_grid) for v in visible]
             ctx = [_expand_tubes(sorted(m), t_grid, s_grid) for m in masked]
-
+        else:
+            ctx, pred = [], []
+            # randomly masked out all patches at frame i, and set all patches not from frame i to be visible context.
+            for _ in range(B):
+                i = rng.randint(0, t_grid - 1) 
+                visible = [p for p in range(t_grid * s_grid * s_grid) if not (i * s_grid * s_grid <= p < (i + 1) * s_grid * s_grid)]
+                ctx.append(visible)
+                masked = [p for p in range(t_grid * s_grid * s_grid) if (i * s_grid * s_grid <= p < (i + 1) * s_grid * s_grid)]
+                pred.append(masked)
         groups.append({"label": label, "n_blocks": n_blocks, "block_hw": (h, w),
                        "ctx": ctx, "pred": pred})
     return groups
@@ -553,12 +560,11 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
         for videos in pbar:
             if cfg.augment:
                 videos = video_aug(videos)
-                
             videos = videos.to(device, non_blocking=True); B = videos.size(0)
-            
             groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng)
             with torch.no_grad(): full = F.layer_norm(tgt_enc(videos), (D,))
             per = {}
+            p2s = []
             if 'vjepa' not in cfg.name:
                 ctr_loss = torch.tensor(0).to(device).float() # accumulate across groups (different masks)
             for g in groups:
@@ -568,32 +574,34 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                 pred_patches = pred(encoded_patches, ci, pi)
                 # Vjepa case
                 # no prediction loss for ctr frame mask
-                per[g["label"]] = (pred_patches - tgt).abs().mean() if g["label"] != 'ctr' else 0
-
+                per[g["label"]] = (pred_patches - tgt).abs().mean() if g["label"] != 'ctr' else torch.tensor(0).to(device).float()
+                
                 # Djepa case
-                if 'vjepa' not in cfg.name and g["label"] == 'ctr':
-                    for i in range(cfg.sem_distill):
-                        local_patches = rearrange( pred_patches, 'B (T S) D -> (B T) S D', T=ctx_enc.t_grid)
-                        global_patches = rearrange(full, 'B (T S) D -> (B T) S D', T=ctx_enc.t_grid)
-                        tgt_h, tgt_w = rng.randint(9, ctx_enc.s_grid), rng.randint(9, ctx_enc.s_grid) # random crop size for teacher
-                        st_mask = None
-                        tgt_mask = random_spatial_mask(B=len(global_patches), h=tgt_h, w=tgt_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
-                      
-                        # Aligned comparisons for non-dynamics
-                        with torch.no_grad(): p2 = centering(tgt_pool(global_patches, masks=tgt_mask)[0], tt_schedule[epoch]).detach()
-                       
-                        p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
-                        loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
-                        ctr_loss += loss # accumulate to the ctr loss
-               
+                if 'vjepa' not in cfg.name and 'ctr' in g["label"] :
+                   
+                    local_patches = pred_patches 
+                    global_patches = tgt
+                    tgt_h, tgt_w = cfg.tgt_crop, cfg.tgt_crop # 10,10
+                    st_h, st_w = cfg.st_crop, cfg.st_crop
+    
+                    st_mask = random_spatial_mask(B=len(local_patches), h=st_h, w=st_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 25%=36/144 of patches
+                    tgt_mask = random_spatial_mask(B=len(global_patches), h=tgt_h, w=tgt_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
+                
+                    # Aligned comparisons for non-dynamics
+                    with torch.no_grad(): p2 = centering(tgt_pool(global_patches, masks=tgt_mask)[0], tt_schedule[epoch]).detach()
+                    p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
+                    loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
+                    ctr_loss = loss # accumulate to the ctr loss
+                    p2s.append(p2)
             per['ctr'] = ctr_loss
-
+    
             loss = sum(per.values()) / len(per)
+
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
             ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m)
             if 'ctr' in cfg.suffix:
-                logits_to_update = p2 # if not cfg.ctr_distill else torch.cat([p2, aligned_p2], dim=0)
+                logits_to_update =  torch.cat(p2s, dim=0) # if not cfg.ctr_distill else torch.cat([p2, aligned_p2], dim=0)
                 centering.update_center(logits_to_update)
             for k, v in per.items(): losses[k].append(v.item())
             
@@ -636,7 +644,7 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
             h, w = visuals.shape[1], visuals.shape[2]
             visuals = visuals.reshape(-1, w, 3)
             logger.log({"visual": wandb.Image(visuals), "epoch": epoch, "step": step})
-        torch.save( {'epoch':epoch, 'encoder': tgt_enc.state_dict()}, encoder_path)
+       
     return tgt_enc, losses
 
 class cfg:
@@ -659,8 +667,8 @@ class cfg:
     ctr_invert = False
     ctr_drop = 0.7
     ctr_tgt_drop = 0.3 # drop teacher patches by x%
-    st_crop = 6 # 6x6
-    tgt_crop = 10 # 10x10
+    st_crop = 4 # 6x6
+    tgt_crop = 9 # 10x10
     # semantic consistency
     sem_distill = 1
     augment = False
@@ -669,7 +677,7 @@ class cfg:
     save_dir = './log'
     name='djepa' # or djepa
     suffix = 'ctr'
-    suffix2 = 'semt_st4/8_tgt9/12'
+    suffix2 = 'semt_DEBUG_st4_tgt9'
     use_wandb = True
     
 def main(cfg,  device=None):

@@ -1,5 +1,5 @@
 #!/bin/bash 
-#SBATCH --job-name=djepa          # Name of your job 
+#SBATCH --job-name=vjdj          # Name of your job 
 #SBATCH --output=/zfsauton2/home/yiqiw2/slurmlogs/job_%j.out    # Standard output log (%j = Job ID) 
 #SBATCH --error=/zfsauton2/home/yiqiw2/slurmlogs/job_%j.err     # Error log 
 #SBATCH --partition=legacy             # (General, Debug, Preempt or Cpu, legacy)
@@ -14,4 +14,5 @@
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate djepa
 
-srun python djepa_ctr_semt.py
+# srun python djepa_ctr_sem_debug.py
+srun python vjepa2_1.py

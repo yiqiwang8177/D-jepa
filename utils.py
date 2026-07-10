@@ -1,4 +1,4 @@
-import torch
+import math, random, torch, numpy as np
 
 def random_drop_mask(B, S, p, device='cpu'):
     """
@@ -46,3 +46,27 @@ def random_spatial_mask(B, h, w, H, W, device="cpu"):
     mask.scatter_(1, idx, True)
 
     return mask
+
+def get_random_h_w(rng, low=1, high=10, min_size=5, max_size=130):
+    valid_pairs = [
+        (h, w)
+        for h in range(low, high + 1)
+        for w in range(low, high + 1)
+        if min_size <= h * w <= max_size
+    ]
+
+    if not valid_pairs:
+        raise ValueError(
+            f"No feasible (h, w) exists with "
+            f"h,w in [{low}, {high}] and "
+            f"area in [{min_size}, {max_size}]"
+        )
+
+    return rng.choice(valid_pairs)
+
+def set_seed(seed: int = 42):
+    random.seed(seed)                  # Python's built-in RNG
+    np.random.seed(seed)               # NumPy global RNG
+    torch.manual_seed(seed)            # CPU RNG (also seeds CUDA in recent versions)
+    torch.cuda.manual_seed_all(seed)   # all GPUs, explicit for safety
+

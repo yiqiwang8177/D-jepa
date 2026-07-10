@@ -8,10 +8,10 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from sklearn.decomposition import PCA
 import torchvision.transforms as T
-from utils import random_drop_mask, random_spatial_mask
+from utils import random_drop_mask, random_spatial_mask, set_seed
+set_seed(42)
 
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
-
 
 def visualize_attnmap(map, size=(96, 96)):
     # map: (s_grid, s_grid)
@@ -549,9 +549,7 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
         for videos in pbar:
             if cfg.augment:
                 videos = video_aug(videos)
-                
             videos = videos.to(device, non_blocking=True); B = videos.size(0)
-            
             groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng)
             with torch.no_grad(): full = F.layer_norm(tgt_enc(videos), (D,))
             per = {}
@@ -566,38 +564,25 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                 # Vjepa case
                 # no prediction loss for ctr frame mask
                 per[g["label"]] = (pred_patches - tgt).abs().mean() if g["label"] != 'ctr' else torch.tensor(0).to(device).float()
-                
                 # Djepa case
-                if 'vjepa' not in cfg.name and g["label"] == 'ctr':
-                    for i in range(cfg.sem_distill):
-                        local_patches = pred_patches # b (t m) d where t=1
-                        
-                        if g["label"] == 'ctr':  # frame-to-frame comparisons, no time axis         
-                            global_patches = tgt
-                            tgt_h, tgt_w = cfg.tgt_crop, cfg.tgt_crop # 10,10
-                            if i == 0 or i < cfg.sem_distill -1:
-                                st_h, st_w = cfg.st_crop, cfg.st_crop
-                            else:
-                                assert False
-                                # if it's the last distill, get large ones, create shifted target
-                                st_h, st_w = tgt_h, tgt_w
-                                shift_pi = (pi + ctx_enc.s_grid * ctx_enc.s_grid) 
-                                valid_mask = (shift_pi < ctx_enc.n_patches).all(dim=-1)
-                                shifted_pi = shift_pi[valid_mask]
-                                global_patches = full[valid_mask].gather(1, shifted_pi.unsqueeze(-1).expand(-1, -1, D)); local_patches = pred_patches[valid_mask]
-                            st_mask = random_spatial_mask(B=len(local_patches), h=st_h, w=st_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 25%=36/144 of patches
-                            tgt_mask = random_spatial_mask(B=len(global_patches), h=tgt_h, w=tgt_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
-                       
-                            # Aligned comparisons for non-dynamics
-                            with torch.no_grad(): p2 = centering(tgt_pool(global_patches, masks=tgt_mask)[0], tt_schedule[epoch]).detach()
-                            p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
-                            loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
-                            ctr_loss += loss # accumulate to the ctr loss
-                            p2s.append(p2)
-               
+                if 'vjepa' not in cfg.name and 'ctr' in g["label"] :
+                    local_patches = pred_patches # b (t m) d where t=1
+                    global_patches = tgt
+                    tgt_h, tgt_w = cfg.tgt_crop, cfg.tgt_crop # 10,10
+                    st_h, st_w = cfg.st_crop, cfg.st_crop
+                    
+                    st_mask = random_spatial_mask(B=len(local_patches), h=st_h, w=st_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 25%=36/144 of patches
+                    tgt_mask = random_spatial_mask(B=len(global_patches), h=tgt_h, w=tgt_w, H=ctx_enc.s_grid, W=ctx_enc.s_grid, device=device) # preserves 70%=100/144 of patches
+                
+                    # Aligned comparisons for non-dynamics
+                    with torch.no_grad(): p2 = centering(tgt_pool(global_patches, masks=tgt_mask)[0], tt_schedule[epoch]).detach()
+                    p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
+                    loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
+                    ctr_loss = loss # accumulate to the ctr loss
+                    p2s.append(p2)
             per['ctr'] = ctr_loss
-    
             loss = sum(per.values()) / len(per)
+
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
             ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m)
@@ -645,7 +630,7 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
             h, w = visuals.shape[1], visuals.shape[2]
             visuals = visuals.reshape(-1, w, 3)
             logger.log({"visual": wandb.Image(visuals), "epoch": epoch, "step": step})
-        torch.save( {'epoch':epoch, 'encoder': tgt_enc.state_dict()}, encoder_path)
+       
     return tgt_enc, losses
 
 class cfg:
@@ -679,7 +664,7 @@ class cfg:
     name='djepa' # or djepa
     suffix = 'ctr'
     suffix2 = 'sem_DEBUG_st4_tgt9'
-    use_wandb = False
+    use_wandb = True
     
 def main(cfg,  device=None):
     if 'vjepa' in cfg.name:
