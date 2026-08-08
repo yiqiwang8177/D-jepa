@@ -1,4 +1,5 @@
 """Minimal V-JEPA 2.1: dense predictive loss, deep self-supervision, image/video co-training."""
+from tqdm import tqdm 
 import os, copy, math, random, wandb, numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -366,7 +367,8 @@ def train(
     }
     step = 0
     for epoch in range(cfg.phase1_epochs):
-        for videos in loader:
+        pbar = tqdm(loader)
+        for videos in pbar:
             mode = "video"; frames = videos.to(device)
             loss, lp, lc = _step_loss(
                 frames,
