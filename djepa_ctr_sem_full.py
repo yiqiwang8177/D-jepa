@@ -8,10 +8,10 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from sklearn.decomposition import PCA
 import torchvision.transforms as T
-from utils import random_spatial_mask, get_token_diff, get_kmean_threshold, dynamic_spatial_mask
-
+from utils import random_spatial_mask, get_token_diff, get_kmean_threshold, dynamic_spatial_mask, save_proposal, get_proposal
 
 MASK_GROUPS = [("short", 8, 0.15), ("long", 2, 0.7), ("ctr", 1, 1)]
+
 
 def visualize_attnmap(map, size=(96, 96)):
     # map: (s_grid, s_grid)
@@ -262,7 +262,7 @@ class RobomimicVideos(Dataset):
         video = torch.stack(frames).permute(1, 0, 2, 3) - 0.5
         if ctr_video is not None:
             video = torch.cat([video, ctr_video], 0)
-        return video
+        return video, idx
 
 class VideoEncoder(nn.Module):
     def __init__(self, num_frames=10, t_patch=2, img_size=64, patch_size=8,
@@ -527,19 +527,22 @@ def sample_vjepa_masks(B, t_grid, s_grid, rng=None, min_ctx=8, ar_range=(0.75, 1
 
 def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema_start=0.99925, ema_end=0.99925, logger = None, encoder_path=None):
     print("=== Phase 1: V-JEPA pretraining ===")
+    id2proposals = {}
     if cfg.augment:
         video_aug = VideoRandomShiftsAug(cfg.patch_size)
     ctx_enc = VideoEncoder(num_frames=cfg.num_frames, img_size=cfg.img_size, patch_size=cfg.patch_size).to(device); tgt_enc = copy.deepcopy(ctx_enc).to(device)
-    centering =  DINOCentering(256).to(device); #  dyn_centering = DINOCentering(256).to(device)  # for centering teacher output in contrastive distillation
+    centering =  DINOCentering(256).to(device);   # for centering teacher output in contrastive distillation
     for p in tgt_enc.parameters(): p.requires_grad_(False)
     pred = JEPAPredictor(t_grid=ctx_enc.t_grid, s_grid=ctx_enc.s_grid).to(device)
     pool = TransformerPooling(ctx_enc.dim).to(device); tgt_pool = copy.deepcopy(pool).to(device)
-    # dyn_pool = TransformerPooling(ctx_enc.dim).to(device); tgt_dyn_pool = copy.deepcopy(dyn_pool).to(device) 
+    dyn_pool = TransformerPooling(ctx_enc.dim).to(device); dyn_centering = DINOCentering(256).to(device)
     for p in tgt_pool.parameters(): p.requires_grad_(False)
     print(f"tubelet grid: t={ctx_enc.t_grid} s={ctx_enc.s_grid} -> {ctx_enc.n_patches} patches")
     params_to_opt = [ctx_enc, pred]
     if cfg.name == 'djepa':
         params_to_opt += [pool,] #  dyn_pool]
+        if cfg.reinit:
+            params_to_opt += [dyn_pool]
 
     opt = torch.optim.AdamW(param_groups(params_to_opt, wd), lr=lr)
     total = epochs * len(loader)
@@ -550,13 +553,11 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
     tt_schedule = [tt_start + (tt_end - tt_start) * min(1, epoch / tt_warm) for epoch in range(epochs)]
     for epoch in range(epochs):
         pbar = tqdm(loader)
-        for videos in pbar:
-
+        for videos, vids in pbar:
             if cfg.augment:
                 videos = video_aug(videos)
                 
             videos = videos.to(device, non_blocking=True); B = videos.size(0)
-            
             groups = sample_vjepa_masks(B, ctx_enc.t_grid, ctx_enc.s_grid, rng=rng)
             with torch.no_grad(): full = F.layer_norm(tgt_enc(videos), (D,))
             per = {}
@@ -590,51 +591,75 @@ def pretrain(cfg, loader, val_loader, rng, epochs, device, lr=3e-4, wd=0.05, ema
                     p1 = F.softmax(pool(local_patches, masks=st_mask)[0] / cfg.ts, dim=-1)  
                     loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean(); p2s.append(p2)
                     ctr_loss += loss # accumulate to the ctr loss
-                    
-                    # Async dynamic case
-                    token_diff = get_token_diff(full, ctx_enc.t_grid); i_s = g['i_s']; #  j_s = rng.choices(range(ctx_enc.t_grid), k=B); 
-                    kmean_converged = False
+                    dyn_exists = np.array([0] * B)
+                    if epoch == cfg.phase2_epochs and cfg.reinit:
+                        # initialize the dyn_pooler, dyn_tgt_pooler, dyn_centering
+                        dyn_centering.load_state_dict(copy.deepcopy(centering.state_dict())); dyn_pool.load_state_dict(copy.deepcopy(pool.state_dict()))
+                        tgt_dyn_pool = copy.deepcopy(dyn_pool).to(device)
                     if epoch >= cfg.phase2_epochs:
-                        dyn_thr, _, kmean_converged = get_kmean_threshold( token_diff ) # takes 0.1~0.2s
-                        if  kmean_converged:  # # kmean_converged:
-                            dyn_proposal = rearrange( rearrange(token_diff, 'B T N -> B (T N)') > dyn_thr.unsqueeze(-1), 'B (T N) -> B T N', T = ctx_enc.t_grid)
-
-                            st_mask = dyn_proposal[torch.arange(B), i_s]; dyn_mask = rearrange(dyn_proposal, 'B T N -> B (T N)')
-                            valid_flag = torch.ones(B, dtype=torch.bool, device=device) # for now, we just use all samples
-                            if valid_flag.any():
-                                tgt = full[valid_flag] # B (T N) d 
-                                with torch.no_grad(): p2 = centering(tgt_pool(tgt, masks=dyn_mask[valid_flag] )[0], tt_schedule[epoch]).detach()
-                                p1 = F.softmax(pool(pred_patches[valid_flag], masks=st_mask[valid_flag])[0] / cfg.ts, dim=-1)
-                                loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean(); p2s.append(p2)
-                                ctr_loss += loss
+                        i_s = g['i_s']
+                        j_s = [rng.choice([j for j in range(ctx_enc.t_grid) if j != i])for i in i_s]
+                        ij_s = torch.tensor([i_s, j_s]).T
+                        # Get or compute dynamic proposal
+                        all_dyn_exists, dyn_exists, dyn_proposal1, dyn_proposal2 = get_proposal( vids, id2proposals, cfg.multi_dyn, rng); original_vids = vids.clone()
+                        if not all_dyn_exists: 
+                            vids = vids[~dyn_exists]; token_diff = get_token_diff(full[~dyn_exists], ctx_enc.t_grid) # token_diff = get_token_diff(full, ctx_enc.t_grid)
+                            dyn_thr, _, _, ind_converged = get_kmean_threshold( token_diff ) # takes 0.1~0.2s
+                            assert len(vids) == len(token_diff), f"{len(vids)} { len(token_diff)}"
+                            if True in ind_converged:
+                                dyn_proposal = rearrange( rearrange(token_diff, 'B T N -> B (T N)') > dyn_thr.unsqueeze(-1), 'B (T N) -> B T N', T = ctx_enc.t_grid)
+                                vids = vids[ind_converged ]; dyn_proposal = dyn_proposal[ind_converged]
+                                if len(vids) > 0:
+                                    id2proposals = save_proposal(id2proposals, vids, dyn_proposal, cfg.multi_dyn)
+                                # retrieve again via full vids
+                                _, dyn_exists, dyn_proposal1, dyn_proposal2 = get_proposal( original_vids, id2proposals, cfg.multi_dyn, rng) 
+                        if dyn_proposal1 is not None and dyn_proposal2 is not None:  
+                            tgt = rearrange( rearrange( full, 'B (T N) d -> B T N d', T = ctx_enc.t_grid)[torch.arange(B)[:, None], ij_s ], 'B T N d -> B (T N ) d')[dyn_exists]
+                            st_mask = dyn_proposal1[torch.arange(B), i_s][dyn_exists]
+                            dyn_mask = rearrange(dyn_proposal2[torch.arange(B)[:, None], ij_s ], 'B T N -> B (T N)')[dyn_exists]
+                            pred_patches = pred_patches[dyn_exists]
+                            with torch.no_grad(): 
+                                if cfg.reinit:
+                                    p2 = dyn_centering(tgt_dyn_pool(tgt, masks=dyn_mask )[0], tt_schedule[epoch-cfg.phase2_epochs]).detach()
+                                else:
+                                    p2 = centering(tgt_pool(tgt, masks=dyn_mask )[0], tt_schedule[epoch]).detach()
+                            p1 = F.softmax(pool(pred_patches, masks=st_mask)[0] / cfg.ts, dim=-1) if not cfg.reinit else F.softmax(dyn_pool(pred_patches, masks=st_mask)[0] / cfg.ts, dim=-1)
+                            loss = -(p2 * (p1 + 1e-8).log()).sum(dim=-1).mean()
+                            if not cfg.reinit:
+                                p2s.append(p2) 
+                            else:
+                                p2s_dyn.append(p2)
+                            dyn_ctr_loss = cfg.dyn_scale * loss
+                            per['dyn_ctr'] = dyn_ctr_loss
+                            if 'dyn_ctr' not in losses:
+                                losses['dyn_ctr'] = []
 
             per['ctr'] = ctr_loss
-    
             loss = sum(per.values()) / len(per)
             loss.backward()
-            m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
+            m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1)) # constant, doesn't matter
             if (step+1) % cfg.accum_steps == 0:
                 opt.step()
                 opt.zero_grad()
                 ema_update(tgt_enc, ctx_enc, m); ema_update(tgt_pool, pool, m)
+                if cfg.reinit and epoch >= cfg.phase2_epochs:
+                    ema_update(tgt_dyn_pool, dyn_pool, m)
                 if 'ctr' in cfg.suffix:
-                    logits_to_update =  torch.cat(p2s, dim=0) 
-                    centering.update_center(logits_to_update)
-                    # if len(p2s_dyn) > 0: 
-                    #     logits_to_update =  torch.cat(p2s_dyn, dim=0)
-                    #     centering.update_center(logits_to_update)
+                    centering.update_center(torch.cat(p2s, dim=0) )
+                    if cfg.reinit and len(p2s_dyn) > 0:
+                        dyn_centering.update_center(torch.cat(p2s_dyn, dim=0) )
             for k, v in per.items(): losses[k].append(v.item())
             
             if (step * cfg.accum_steps) % 25 == 0:
                 msg = " ".join(f"{k}={v.item():.4f}" for k, v in per.items())
                 pbar.set_postfix_str(f"ep={epoch} {msg} ema={m:.4f}")
                 if logger:
-                    logger.log({"epoch": epoch, "step": step // cfg.accum_steps, "ema": m, 'temp_teacher': tt_schedule[epoch], 'kmean_converge': int(kmean_converged), **{f"loss_{k}": v.item() for k, v in per.items()}})
+                    logger.log({"epoch": epoch, "step": step // cfg.accum_steps, "ema": m, 'temp_teacher': tt_schedule[epoch], 'kmean_converge': np.mean(dyn_exists), **{f"loss_{k}": v.item() for k, v in per.items()}})
             step += 1
 
         if logger:
             visuals, visual_interval = [], cfg.num_frames * 2
-            for i, (videos) in enumerate(val_loader):
+            for i, (videos, _) in enumerate(val_loader):
                 if i % visual_interval == 0:
                     videos = videos.to(device)
 
@@ -670,11 +695,11 @@ class cfg:
     img_size = 96
     patch_size = 8 # 8 works for robomimic
     num_frames = 8
-    phase1_epochs = 50
-    phase2_epochs = 40 # 3 # 30
+    phase1_epochs = 70
+    phase2_epochs = 50 # 40
     batch_size= 128 # 64
     accum_steps=1 # 2
-    episodes = 100
+    episodes = 100 # 100
     ts = 0.1 # student temp 
     tt_min = 0.04 # teacher temp start
     tt_max = 0.07 # teacher temp end
@@ -692,13 +717,15 @@ class cfg:
     # semantic consistency
     sem_distill = 1
     augment = False
-
+    multi_dyn = 3 # 3 # multiple dynamic proposals
+    dyn_scale = 1.0
+    reinit = True
     # Logging 
     save_dir = './log'
     name='djepa' # or djepa
     suffix = 'ctr'
-    suffix2 = 'sem_st4_tgt9_dynst_notspatial_new_static' # 'sem_st4_tgt9_dynst_new' # 'sem_st4_tgt9_dynt'
-    use_wandb = False
+    suffix2 = 'sem_st4_tgt9_dynst_ij_multi3_reinit' # 'sem_st4_tgt9_dynst_new' # 'sem_st4_tgt9_dynt'
+    use_wandb = True
     
 def main(cfg,  device=None):
     if 'vjepa' in cfg.name:
@@ -709,7 +736,10 @@ def main(cfg,  device=None):
     device = device or pick_device(); print(f"device: {device}")
     rng = random.Random(0)
     cfg.batch_size = cfg.batch_size // cfg.accum_steps
-    ds = RobomimicVideos(episodes=cfg.episodes, cfg= cfg, rng=rng, img_size=cfg.img_size, num_frames=cfg.num_frames, ctr_shift=cfg.ctr_shift)
+    ds = RobomimicVideos(
+        episodes=cfg.episodes, 
+        cfg= cfg, rng=rng, img_size=cfg.img_size, num_frames=cfg.num_frames, ctr_shift=cfg.ctr_shift)
+
     val_ds = RobomimicVideos(robots=['panda'], episodes=1, cfg= cfg, rng=random.Random(0), img_size=cfg.img_size, num_frames=cfg.num_frames)
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=8, prefetch_factor=4, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, drop_last=True)

@@ -167,7 +167,7 @@ def get_kmean_threshold(x, num_iters=15, eps=1e-6):
         new_c1 = torch.where(count1 == 0, centers[:, 1], new_c1)
 
         new_centers = torch.stack([new_c0, new_c1], dim=1)
-        shift = (new_centers - centers).abs().max()
+        shift = (new_centers - centers).abs().max(); ind_converged = (new_centers - centers).abs().max(dim=1).values < eps
         centers = new_centers
         if shift < eps:
             has_converged = True 
@@ -181,7 +181,7 @@ def get_kmean_threshold(x, num_iters=15, eps=1e-6):
 
     masked_x = x.masked_fill(~high_mask, float("inf"))
     thresholds = masked_x.min(dim=1).values  # (B,)
-    return thresholds, _, has_converged
+    return thresholds, _, has_converged, ind_converged.cpu()
 
 def get_token_diff(full_tokens, T):
     # Get median difference across time
@@ -197,3 +197,26 @@ def get_token_diff(full_tokens, T):
         diff = diff.median(dim=2).values
     # B x T x N
     return diff
+
+def save_proposal( id2proposals, ids, proposals, multi_dyn):
+    ids = ids.cpu().numpy()
+    proposals = proposals.cpu()
+    for id, proposal in zip(ids, proposals):
+        if id not in id2proposals:
+            id2proposals[id] = [  ]
+        if len(id2proposals[id]) < multi_dyn:
+            id2proposals[id] += [ proposal ]
+    return id2proposals
+
+def get_proposal(ids, id2proposals, multi_dyn, rng, device = 'cuda'):
+    ids = ids.cpu().numpy()
+    exists = [ id in id2proposals and len(id2proposals[id]) == multi_dyn for id in ids]
+    all_exists = False not in exists
+    if not all_exists:
+        return False, np.array( [False] * len(ids)), None, None
+    # only start to sample if all exists
+    proposals1 = torch.cat( [ rng.choice( id2proposals[id] ).unsqueeze(0)  for id in ids], 0 )
+    proposals2 = torch.cat( [ rng.choice( id2proposals[id] ).unsqueeze(0)  for id in ids], 0 )
+
+    return all_exists, np.array( exists), proposals1.to(device), proposals2.to(device)
+

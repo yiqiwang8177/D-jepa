@@ -6,7 +6,7 @@
 #SBATCH --qos=qos_legacy               # Matches the partition for guaranteed priority
 #SBATCH --ntasks=1                      # Number of tasks 
 #SBATCH --cpus-per-task=8               # CPU cores per task 
-#SBATCH --mem=32G                       # Memory (RAM) limit 
+#SBATCH --mem=64G                       # Memory (RAM) limit 
 #SBATCH --time=2-00:00:00                       # Time limit (D-HH:MM:SS)          
 #SBATCH --gres=gpu:rtx_2080_ti:1
 
